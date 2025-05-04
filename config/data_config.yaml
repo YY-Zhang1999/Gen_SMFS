@@ -1,0 +1,78 @@
+# config/data_config.yaml
+
+# Data paths and preprocessing parameters
+
+data_paths:
+  # Directory for raw data files (e.g., CSVs from experiments/simulations)
+  raw_data_dir: data/raw
+
+  # Directory for processed data files (ready for dataset loading)
+  processed_data_dir: data/processed
+
+  # File names for processed data (relative to processed_data_dir)
+  processed_fe_curves_file: fe_curves.npy
+  processed_sequences_file: sequences.csv
+  processed_conditions_file: conditions.csv
+
+  # Optional: File name for raw data input if loading a single file
+  # raw_input_file: my_protein_data.csv
+
+data_preprocessing:
+  # Target fixed length for standardized Force-Extension curves
+  fe_curve_length: 500
+
+  # Number of channels in the F-E curve data (typically 1 for force)
+  fe_curve_channels: 1
+
+  # Type of protein sequence encoding used in the processed_sequences_file
+  # Options: 'raw', 'onehot', 'pretrained_embeddings'
+  seq_encoding_type: pretrained_embeddings # Or 'raw' or 'onehot'
+
+  # If using 'pretrained_embeddings', specify the input dimension (from PLM)
+  # protein_input_dim: 1024 # Example for a PLM like ESM-2 (depends on your PLM)
+
+  # If using 'onehot', specify the input dimensions (seq_len, alphabet_size)
+  # protein_input_dims_onehot: [50, 20] # Example: max seq len 50, 20 AA
+
+  # List of column names in the raw data file that contain the protein sequence(s)
+  # sequence_column: sequence # Name of the column containing sequence strings
+
+  # List of column names in the raw data file that contain experimental/simulation conditions
+  # These will be used to form the condition vector
+  condition_columns:
+    - pulling_speed_nm_per_s # Example condition: constant pulling speed
+
+  # Number of condition features (derived from length of condition_columns)
+  # condition_input_dim: 1 # Will be determined from condition_columns in script
+
+  # Strategy for Force-Extension curve normalization
+  # Options: 'max_force', 'contour_length', 'none'
+  fe_curve_normalization_strategy: max_force
+
+  # If fe_curve_normalization_strategy is 'max_force', provide the global maximum force
+  # This should be a value representative of the expected max force in your dataset
+  global_max_force: 300.0 # Example: 300 pN
+
+  # If your raw force data units are not in pN, specify a conversion factor to pN
+  # force_unit_conversion_to_pN: 1.0 # Example: 1.0 if already in pN
+
+# Parameters for mechanical property analysis (used in evaluation/analysis modules)
+# You might need these when evaluating the quality of generated curves based on properties
+analysis_params:
+  # Parameters for peak finding (used by find_force_peaks)
+  find_peaks:
+    height: 10.0 # Minimum height of peaks
+    distance: 20 # Minimum horizontal distance between peaks
+    prominence: 5.0 # Minimum prominence of peaks
+    smoothing_window: 5 # Moving average smoothing window
+    smoothing_sigma: null # Gaussian smoothing sigma (use one smoothing method)
+    # Add other scipy.signal.find_peaks parameters as needed
+
+  # Parameters for WLC fitting (used by curve_fitting)
+  wlc_fitting:
+    temperature_K: 300.0 # Temperature in Kelvin
+    p_guess: 0.9 # Initial guess for persistence length (nm)
+    p_bounds: [0.1, 5.0] # Bounds for persistence length (min, max) in nm
+    Lc_bounds_min_factor: 1.0 # Lower bound for Lc = max_ext * factor
+    Lc_bounds_max_factor: 2.0 # Upper bound for Lc = max_ext * factor
+    # force_unit_conversion_to_pN: 1.0 # Ensure consistency with force units

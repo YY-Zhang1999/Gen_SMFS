@@ -1,0 +1,77 @@
+.
+├── data/
+│   ├── README.md
+│   ├── raw/
+│   │   ├── experimental/  # For raw experimental data files (AFM-SMFS, optical tweezers, etc.)
+│   │   └── simulation/    # For raw simulation data files (MD, SMD, etc.)
+│   └── processed/
+│       ├── README.md
+│       ├── protein_sequences.csv  # Processed protein sequences and metadata
+│       ├── fe_curves.pkl        # Processed F-E curves (e.g., normalized, interpolated)
+│       └── conditions.csv       # Processed experimental/simulation conditions
+│
+├── notebooks/
+│   ├── 01_data_preprocessing.ipynb
+│   ├── 02_exploratory_data_analysis.ipynb
+│   ├── 03_model_development.ipynb
+│   ├── 04_model_training.ipynb
+│   ├── 05_inference_and_generation.ipynb
+│   ├── 06_mechanical_property_analysis.ipynb
+│   └── 07_evaluation.ipynb
+│
+├── src/
+│   ├── __init__.py
+│   ├── data_processing/
+│   │   ├── __init__.py
+│   │   ├── dataset.py      # PyTorch Dataset or similar for loading processed data
+│   │   ├── preprocessing.py  # Functions for normalization, interpolation, encoding
+│   │   └── utils.py          # Utility functions for data handling
+│   │
+│   ├── models/
+│   │   ├── __init__.py
+│   │   ├── diffusion_model.py  # Main Diffusion Model architecture
+│   │   ├── protein_encoder.py  # Protein sequence encoder (e.g., Transformer-based PLM wrapper)
+│   │   ├── condition_encoder.py # Encoder for experimental/simulation conditions
+│   │   └── components/       # Smaller building blocks of the model (e.g., Attention layers, U-Net blocks)
+│   │       ├── __init__.py
+│   │       └── attention.py
+│   │
+│   ├── training/
+│   │   ├── __init__.py
+│   │   ├── trainer.py        # Class for managing the training loop
+│   │   ├── losses.py         # Custom loss functions (noise prediction, mechanical property loss)
+│   │   └── optimizers.py     # Optimizer setup and learning rate scheduling
+│   │
+│   ├── inference/
+│   │   ├── __init__.py
+│   │   └── generator.py      # Class/functions for generating F-E curves from trained model
+│   │
+│   ├── analysis/
+│   │   ├── __init__.py
+│   │   ├── mechanical_properties.py # Functions for calculating unfolding energy, max force, etc.
+│   │   └── curve_fitting.py      # Functions for fitting polymer elasticity models (WLC)
+│   │
+│   └── evaluation/
+│       ├── __init__.py
+│       ├── metrics.py          # Evaluation metrics (R^2, L2 error, DTW, etc.)
+│       └── visualizer.py       # Functions for visualizing generated vs. true curves
+│
+├── config/
+│   ├── data_config.yaml      # Data paths, preprocessing parameters
+│   ├── model_config.yaml     # Model hyperparameters, architecture details
+│   └── training_config.yaml  # Training parameters (epochs, batch size, learning rate)
+│
+├── scripts/
+│   ├── train.py              # Script to start model training
+│   ├── generate.py           # Script to generate curves using a trained model
+│   ├── analyze_results.py    # Script to run analysis and evaluation
+│   └── preprocess_data.py    # Script to run data preprocessing
+│
+├── trained_models/         # Directory to save trained model weights and checkpoints
+│   └── README.md
+│
+├── results/                # Directory to save analysis results, generated curves, plots
+│   └── README.md
+│
+├── README.md               # Project overview, setup instructions, how to run
+└── requirements.txt        # Python dependencies

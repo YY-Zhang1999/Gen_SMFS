@@ -1,0 +1,61 @@
+# config/training_config.yaml
+
+# Training parameters
+
+# --- General Training Parameters ---
+epochs: 100 # Total number of training epochs
+batch_size: 32 # Batch size for training
+
+# Device to use for training ('cuda' or 'cpu')
+device: cuda # Or cpu
+
+# Logging and Checkpointing
+log_dir: runs/              # Directory for TensorBoard logs
+checkpoint_dir: checkpoints/ # Directory to save model checkpoints
+save_interval: 10           # Save a checkpoint every N epochs
+eval_interval: 5            # Evaluate on the validation set every N epochs
+
+# --- Optimizer Parameters ---
+optimizer:
+  name: adamw # Optimizer name ('adam', 'adamw')
+  lr: 0.0001 # Learning rate
+  weight_decay: 0.00001 # Weight decay (L2 penalty)
+
+# --- Learning Rate Scheduler Parameters ---
+scheduler:
+  name: cosine # Scheduler name ('step', 'reduceonplateau', 'cosine', 'none')
+  params: # Parameters specific to the scheduler type
+    # If name is 'step':
+    # step_size: 30 # Number of epochs before reducing LR
+    # gamma: 0.1 # Factor to multiply LR by
+
+    # If name is 'reduceonplateau':
+    # mode: min # 'min' or 'max' (monitor validation loss typically)
+    # factor: 0.5 # Factor by which the LR will be reduced
+    # patience: 10 # Number of epochs with no improvement before reducing LR
+    # threshold: 0.0001 # Threshold for measuring the new optimum
+    # cooldown: 0 # Number of epochs to wait before resuming normal operation after LR has been reduced
+    # min_lr: 0 # Minimum learning rate
+
+    # If name is 'cosine':
+    T_max: 100 # Maximum number of training epochs (should match or be less than total epochs)
+    eta_min: 0 # Minimum learning rate
+
+    # If name is 'none', params can be empty or omitted {}
+
+# --- Loss Function Parameters ---
+# Weights for the different loss components. Total Loss = noise_weight*noise_loss + mech_prop_weight*mech_prop_loss + curve_match_weight*curve_match_loss
+loss:
+  noise_weight: 1.0 # Weight for the primary noise prediction loss (MSE)
+
+  # Optional Losses (set weight > 0 to enable)
+  mech_prop_weight: 0.0 # Weight for the mechanical property loss (requires implementation and differentiable extraction)
+  curve_match_weight: 0.0 # Weight for the generated curve matching loss (requires implementation)
+
+  # If mech_prop_weight > 0, specify weights for individual properties
+  mech_prop_weights:
+    # unfolding_energy: 0.5
+    # max_force: 0.5
+    # num_peaks: 0.2 # Example: Could also penalize wrong number of peaks
+    # avg_unfolding_force: 0.3
+    # Add weights for other properties you want to penalize

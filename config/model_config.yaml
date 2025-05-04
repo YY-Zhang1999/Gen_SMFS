@@ -1,0 +1,50 @@
+# config/model_config.yaml
+
+# Model hyperparameters and architecture details
+
+# --- Overall Model Parameters ---
+fe_curve_length: 500 # Must match data_config.fe_curve_length
+fe_curve_channels: 1 # Must match data_config.fe_curve_channels
+
+# --- Protein Encoder Parameters ---
+protein_encoding_type: pretrained_embeddings # Options: 'raw', 'onehot', 'pretrained_embeddings'
+protein_embed_dim: 128 # Desired output dimension of the protein embedding
+
+# If protein_encoding_type is 'pretrained_embeddings':
+protein_input_dim: 1024 # Input dimension from pre-computed embeddings (e.g., PLM output dim)
+
+# If protein_encoding_type is 'onehot':
+# protein_input_dims_onehot: [50, 20] # Input dimensions (seq_len, alphabet_size)
+
+# If protein_encoding_type is 'raw' (PLM integration):
+protein_plm_name: "esm2_t6_8m_UR50D" # Name of the pretrained language model to load
+protein_plm_embed_dim: 768 # Dimensionality of the PLM output embeddings per residue (e.g., for ESM-2)
+protein_freeze_plm: true # Whether to freeze the PLM weights during training
+
+# --- Condition Encoder Parameters ---
+# condition_input_dim: 1 # Input dimension from conditions (number of features). Will be inferred from data_config.condition_columns
+condition_embed_dim: 64 # Desired output dimension of the condition embedding
+
+# --- Time Embedding Parameters ---
+time_embed_dim: 128 # Dimensionality of the time embedding
+
+# --- Denoising Model Parameters ---
+# This section configures the ConditionalDenoisingModel architecture
+model_channels: 256 # Base number of channels/features in the denoising network layers
+num_layers: 6 # Number of processing layers/blocks in the denoising network
+
+# Parameters if using Attention layers within the DenoisingModel
+num_attention_heads: 8
+
+# --- Diffusion Process Parameters ---
+num_diffusion_steps: 1000 # Number of diffusion steps (T)
+beta_schedule: linear # Variance schedule for forward diffusion ('linear' or 'cosine')
+
+# --- Optional: Denoising Model Specific Architecture Details ---
+# If your DenoisingModel has specific sub-components (e.g., U-Net stages, Transformer block configs)
+# you can add nested dictionaries here.
+# denoising_architecture:
+#   type: UNet1D # Example: Specify UNet variant for 1D data
+#   unet_channels_mult: [1, 2, 4] # Channel multipliers for U-Net stages
+#   attention_resolutions: [16, 8] # Resolutions at which to apply attention
+#   num_res_blocks: 2 # Number of residual blocks per stage
