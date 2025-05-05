@@ -16,7 +16,7 @@ class FEDataset(Dataset):
     Assumes data has been preprocessed and stored in specified file formats.
     """
     def __init__(self, fe_curves_path: str, sequences_path: str, conditions_path: str,
-                 seq_encoding_type: str = 'onehot', fe_curve_length: int = 500):
+                 seq_encoding_type: str = 'onehot', fe_curve_length: int = 1000):
         """
         Initializes the FEDataset.
 

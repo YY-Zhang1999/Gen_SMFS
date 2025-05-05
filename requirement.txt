@@ -1,0 +1,13 @@
+torch>=1.8.0
+numpy>=1.20.0
+pandas>=1.2.0
+PyYAML>=5.4.1 # For loading configurations
+scipy>=1.6.0 # For interpolation, peak finding, curve fitting
+scikit-learn>=0.24.0 # For R^2 score
+dtw-python>=1.20.0 # For Dynamic Time Warping
+matplotlib>=3.3.0 # For plotting
+tensorboard>=2.5.0 # For logging training progress
+
+# Optional: uncomment if using raw protein sequence encoding with a PLM
+# transformers>=4.0.0
+# accelerate>=0.0.0 # Might be needed for distributed training/inference with transformers
