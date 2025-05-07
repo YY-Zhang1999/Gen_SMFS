@@ -410,7 +410,6 @@ def analyze_force_curves(ibw_file_path, temp, fit_threshold, make_plots, path_st
         print(f"Peak detection error: {e}")
         # Continue with empty arrays
 
-
     # Find valleys (negative peaks)
     neg_pks_f = []
     neg_locs_f = []
@@ -590,7 +589,7 @@ def plot_force_extension(extension, force, save_path=None):
 # Example usage
 if __name__ == "__main__":
     # Replace with your .ibw file path
-    file_path = "Image0000.ibw"
+    file_path = "../../data/raw/Image0000.ibw"
 
     # Extract data
     extension, force = extract_force_extension(file_path)

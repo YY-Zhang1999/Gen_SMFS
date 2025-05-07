@@ -26,6 +26,7 @@ class ForceCurveAnalyzer:
         self.make_plots = make_plots
         self.diagnostics = diagnostics
         self.kb = 1.38064852e-23  # Boltzmann constant in J/K or m^2 kg s^-2 K^-1
+        self.fig_no = 0
 
     def _get_force_wlc(self, lc, p, separation, temperature_k):
         """
@@ -109,7 +110,8 @@ class ForceCurveAnalyzer:
         v_read_success = False
 
         # Extract Spring Constant
-        k_spr_match = re.search(r"SpringConstant\s*([0-9\.\-eE]+)", wave_notes_str, re.IGNORECASE)
+        k_spr_match = re.search(r"SpringConstant:\s*(-?\d+\.?\d*)", wave_notes_str, re.IGNORECASE)
+        print(wave_notes_str)
         if k_spr_match:
             try:
                 spring_constant_nm = float(k_spr_match.group(1))
@@ -121,7 +123,7 @@ class ForceCurveAnalyzer:
             print("SpringConstant not found in wave notes.")
 
         # Extract Retract Velocity
-        v_match = re.search(r"RetractVelocity\s*([0-9\.\-eE]+)", wave_notes_str, re.IGNORECASE)
+        v_match = re.search(r"RetractVelocity:\s*([0-9\.\-eE]+)", wave_notes_str, re.IGNORECASE)
         if v_match:
             try:
                 retract_velocity_ms = float(v_match.group(1))
@@ -134,335 +136,658 @@ class ForceCurveAnalyzer:
 
         return spring_constant_nm, retract_velocity_ms, k_read_success, v_read_success
 
-    def _process_raw_curve_data(self, y_data, k_spring):
+    def _process_raw_curve_data(self, y_data, k_spring):  # Renamed k_spr to k_spring
         """
         Processes raw y_data to extract approach and retract curves,
         corrects baseline, and converts to force vs. separation.
-
-        Parameters:
-        y_data (np.array): The raw data array from the IBW file. Expected to have
-                           at least 3 columns (e.g., Z-sensor, Deflection, Height).
-                           The specific columns used are based on typical AFM setups.
-        k_spring (float): Cantilever spring constant (N/m).
-
-        Returns:
-        tuple: (dfln_fs_corrected, apr_corrected, success)
-               dfln_fs_corrected (np.array): Processed retraction curve [separation (m), force (N)].
-                                             Returns None if processing fails.
-               apr_corrected (np.array): Processed approach curve [separation (m), force (N)].
-                                         Returns None if processing fails.
-               success (bool): True if processing was successful.
+        This version is based on the user-provided snippet.
         """
-        if y_data.ndim < 2 or y_data.shape[1] < 3:  # Assuming Height, Deflection, ZSensor (or similar)
-            print(f"Error: IBW data has unexpected shape: {y_data.shape}. Expected at least 3 columns.")
+        # Initial checks for y_data
+        if y_data is None or not isinstance(y_data, np.ndarray):
+            if self.diagnostics: print("Error: y_data is None or not a numpy array.")
             return None, None, False
 
-        # Column indices based on common AFM data formats (e.g., Asylum AFM)
-        # Channel 0: Height (Piezo position of the tip relative to a starting point)
-        # Channel 1: Deflection (Cantilever deflection signal, proportional to force)
-        # Channel 2: ZSensor (Calibrated Z position of the piezo)
-        # Separation = ZSensor - Deflection (or Height - Deflection, depending on setup and calibration)
-        # Force = Deflection * SpringConstant
-
-        # For simplicity, let's assume:
-        # Column 2 (index 2) is Z-position (stage or piezo) -> often 'ZSnsr' or 'Height'
-        # Column 1 (index 1) is Deflection signal (Volts or nm) -> often 'Defl'
-
-        # Heuristic to find the turning point (contact point / max force point)
-        # This often corresponds to the maximum value in the Z-sensor or deflection channel
-        # during the approach/retract cycle. For a standard force curve, the data points
-        # are often ordered from approach start to retract end.
-
-        # A more robust way is to look at the Z-sensor data (assuming it's monotonic for approach/retract segments)
-        # Find the point where Z-sensor changes direction or reaches its extremum.
-        # For now, let's assume data is [approach_points, retract_points] concatenated.
-        # The midpoint is a common, though not always accurate, separator.
-
-        num_points = y_data.shape[0]
-        # A simple way to separate approach and retract is by looking for the point of maximum Z travel or deflection
-        # Let's assume column 2 is the Z-sensor data which extends and then retracts.
-        # The point of maximum extension is often the switch from approach to retract.
-        if num_points < 10:  # Not enough data
-            print("Error: Not enough data points in the curve.")
+        if y_data.ndim == 0:  # Handle 0-dimensional array
+            if self.diagnostics: print("Error: y_data is 0-dimensional.")
             return None, None, False
 
-        # Find the approximate contact point or turning point
-        # In many systems, the Z-sensor (col 2) or Height (col 0) shows the piezo movement.
-        # The deflection (col 1) shows the cantilever bending.
-        # We'll use the Z-sensor (y_data[:, 2]) to find the turning point, assuming it dictates the overall motion.
-        # If Z-sensor data is not available or reliable, one might use the deflection signal.
+        min_required_points = 10  # Minimum points to be considered valid data
+        if y_data.shape[0] < min_required_points:
+            if self.diagnostics: print(
+                f"Error: Not enough data points in y_data (found {y_data.shape[0]}, need at least {min_required_points}).")
+            return None, None, False
 
-        # Simplified split: find the index of the maximum value in the Z-sensor or Height column
-        # This often marks the end of approach / start of retract.
-        # This is a common simplification. A more sophisticated method would analyze velocities or use metadata if available.
-        # Let's use column 2 (Z-sensor) as primary, fallback to column 0 (Height) if needed.
+        # *************************************************************
+        # Crop the retraction and approach curves
+        # *************************************************************
+        m, n = y_data.shape if y_data.ndim > 1 else (y_data.shape[0], 1)
 
-        z_sensor_col_idx = 2
-        if y_data.shape[1] <= z_sensor_col_idx:
-            z_sensor_col_idx = 0  # Fallback to Height if ZSensor column is not present
-            if y_data.shape[1] <= z_sensor_col_idx:  # Still not enough columns
-                print("Error: Not enough columns for Z-sensor or Height data.")
+        dfl = np.array([])  # Retract curve (deflection-like)
+        apr = np.array([])  # Approach curve (deflection-like)
+
+        if n == 1:
+            # 1D data: [value]
+            # We'll assume this single column is a force or deflection signal.
+            # Separation will be a proxy based on index.
+            force_col_1d = 0
+
+            # Check for sufficient points after potential slicing
+            if m < min_required_points:
+                if self.diagnostics: print(f"Error: Not enough data points for 1D processing (found {m}).")
                 return None, None, False
 
-        # Find the turning point based on the Z-sensor (or Height) data
-        # This point is often where the piezo reverses direction.
-        # It's usually the point of maximum extension of the Z-piezo.
-        # If data is ordered approach -> retract, this is the max Z value.
-        # If data is ordered retract -> approach, this is the min Z value.
-        # Assuming standard approach then retract:
-        turn_point_idx = np.argmax(y_data[:, z_sensor_col_idx])
+            y_col_data = y_data[:, force_col_1d] if y_data.ndim > 1 else y_data  # Handle truly 1D array
 
-        if turn_point_idx == 0 or turn_point_idx == num_points - 1:
-            # If max is at the start/end, it might be a monotonic curve or bad data.
-            # As a fallback, use midpoint, but this is less reliable.
-            if self.diagnostics: print("Warning: Z-sensor maximum at curve boundary. Using midpoint to split.")
-            turn_point_idx = num_points // 2
+            m_max = np.max(y_col_data)
+            m_min = y_col_data[-1] if m > 0 else 0  # Handle empty y_col_data case
 
-        approach_raw = y_data[:turn_point_idx, :]
-        retract_raw = y_data[turn_point_idx:, :]
+            # Avoid issues if m_max equals m_min (flat line)
+            if m_max == m_min:
+                T = 0  # No change, so threshold won't trigger unless data is above m_min
+            else:
+                T = 0.6 * (m_max - m_min)
 
-        if approach_raw.shape[0] < 5 or retract_raw.shape[0] < 5:
-            print("Error: Not enough data points in approach or retract segments after splitting.")
-            return None, None, False
+            # Extract retraction curve (dfl)
+            dfl_list = []
+            # Iterate safely, ensure 'i' doesn't go out of bounds
+            for i in range(m - 1, -1, -1):
+                if (y_col_data[i] - m_min) > T:
+                    break  # Found start of "contact" or significant feature from the retract end
+                # Using index/m as a proxy for position (extension-like value)
+                # Storing [proxy_extension, value]
+                dfl_list.append([i / float(m) if m > 0 else 0, y_col_data[i]])
+            if dfl_list:
+                dfl = np.array(dfl_list)
+                if dfl.ndim == 1 and dfl.shape[0] > 0:
+                    dfl = dfl.reshape(-1, 2)  # ensure 2D if only one point
+                elif dfl.shape[0] == 0:
+                    dfl = np.empty((0, 2))
+            else:
+                dfl = np.empty((0, 2))
 
-        # Extract Deflection (col 1) and Z-sensor/Height (col 2 or 0) for each segment
-        # Retraction curve data (often plotted with Z decreasing)
-        # We usually analyze the retract curve for unfolding events.
-        # The MATLAB code flips the retract curve (dfl_cur = flip(dfl(:,2));)
-        # Here, we'll keep the natural order but select the appropriate columns.
+            # Extract approach curve (apr)
+            apr_list = []
+            for i in range(m):
+                if (y_col_data[i] - m_min) > T:
+                    break  # Found end of "non-contact" or start of significant feature from approach start
+                apr_list.append([i / float(m) if m > 0 else 0, y_col_data[i]])
+            if apr_list:
+                apr = np.array(apr_list)
+                if apr.ndim == 1 and apr.shape[0] > 0:
+                    apr = apr.reshape(-1, 2)
+                elif apr.shape[0] == 0:
+                    apr = np.empty((0, 2))
+            else:
+                apr = np.empty((0, 2))
 
-        # Retraction:
-        # Separation_retract = ZSensor_retract - Deflection_retract
-        # Force_retract = Deflection_retract * k_spring
-        defl_retract = retract_raw[:, 1]
-        zsens_retract = retract_raw[:, z_sensor_col_idx]
-        sep_retract = zsens_retract - defl_retract  # True tip-sample separation
-        force_retract = defl_retract * k_spring
+        else:  # Multi-column data (n > 1)
+            if n < 3:  # Need at least extension and force columns (assuming col 0 is index/time)
+                if self.diagnostics: print(
+                    f"Error: Multi-column data has {n} columns, expected at least 2 (ext, force) or 3 (e.g. Z, Defl, Height). Assuming ext=col 0, force=col 1.")
+                if n < 2: return None, None, False  # Cannot proceed
+                ext_col = 0
+                force_col = 1
+            else:  # Assuming specific columns as per the provided snippet
+                force_col = 1  # Deflection/Force signal
+                ext_col = 2  # Extension/Z-piezo signal
 
-        # Approach:
-        defl_approach = approach_raw[:, 1]
-        zsens_approach = approach_raw[:, z_sensor_col_idx]
-        sep_approach = zsens_approach - defl_approach
-        force_approach = defl_approach * k_spring
+            # Threshold to detect retraction curve based on force_col
+            force_signal_data = y_data[:, force_col]
+            m_max = np.max(force_signal_data)
+            m_min = force_signal_data[-1]  # Last point as minimum reference
 
-        # Baseline correction (similar to MATLAB script's offset removal)
-        # Use the initial part of the approach curve (non-contact) to find force offset
-        # Or the final part of the retract curve (non-contact)
+            if m_max == m_min:
+                M = 0  # Handle flat line case
+            else:
+                M = m_max - m_min
 
-        # For retract curve baseline: use the tail end (furthest from contact)
-        if len(force_retract) > 20:  # Ensure enough points for baseline
-            baseline_force_offset_retract = np.mean(force_retract[-int(len(force_retract) * 0.2):])  # Use last 20%
-        elif len(force_retract) > 0:
-            baseline_force_offset_retract = np.mean(force_retract)
+            T = 0.6 * M  # Ad hoc threshold
+
+            # Extract retraction curve (dfl) from multi-column data
+            # Moving from end to start of y_data
+            breakpoint_idx_retract = m  # Start assuming all points are part of retract tail
+            for i in range(m - 1, -1, -1):
+                if (force_signal_data[i] - m_min) > T:
+                    breakpoint_idx_retract = i  # This is the point where curve deviates from baseline
+                    break
+
+            # Points from breakpoint_idx_retract to m-1 form the initial part of dfl
+            # The original code's `j` seems to count points from the end until the break.
+            # So, dfl contains `m - breakpoint_idx_retract` points.
+            # Let's adjust: if breakpoint_idx_retract is where deviation starts, then
+            # points from breakpoint_idx_retract to end of array are part of the "tail".
+            # The Matlab code seems to take points from `m-j` to `m`, where `j` is count from end.
+            # This corresponds to taking points from `breakpoint_index` (inclusive) to `m-1`.
+
+            num_pts_dfl = m - breakpoint_idx_retract
+            if num_pts_dfl <= 0:  # No points identified for dfl, or only one point
+                dfl = np.empty((0, 2))
+            else:
+                dfl = np.zeros((num_pts_dfl, 2))
+                k_dfl = 0
+                # Iterating from where the significant part of the retract curve starts (closer to contact)
+                # The Matlab code: for i = m-j:1:m --> if breakpoint is at `idx`, then `j = m-idx`. So iterate from `idx` to `m`.
+                # Python: range(breakpoint_idx_retract, m)
+                for idx_orig in range(breakpoint_idx_retract, m):
+                    dfl[k_dfl, 0] = y_data[idx_orig, ext_col]  # Extension value
+                    dfl[k_dfl, 1] = y_data[idx_orig, force_col]  # Force/Deflection value
+                    k_dfl += 1
+
+            # Extract approach curve (apr) from multi-column data
+            # Moving from start to end of y_data
+            breakpoint_idx_approach = m  # Default if no break found (all data is "baseline")
+            for i in range(m):
+                if (force_signal_data[
+                        i] - m_min) > T:  # Using same m_min, T for consistency. Could re-eval for approach.
+                    breakpoint_idx_approach = i  # This is where approach curve starts to deviate
+                    break
+
+            num_pts_apr = breakpoint_idx_approach  # Points from 0 to breakpoint_idx_approach-1
+            if num_pts_apr <= 0:
+                apr = np.empty((0, 2))
+            else:
+                apr = np.zeros((num_pts_apr, 2))
+                k_apr = 0
+                for idx_orig in range(num_pts_apr):  # up to (but not including) breakpoint_idx_approach
+                    apr[k_apr, 0] = y_data[idx_orig, ext_col]
+                    apr[k_apr, 1] = y_data[idx_orig, force_col]
+                    k_apr += 1
+
+        # Check if dfl or apr are too short after extraction
+        if dfl.shape[0] < min_required_points // 2 and apr.shape[0] < min_required_points // 2:  # Relaxed requirement
+            if self.diagnostics: print(
+                f"Warning: Retract ({dfl.shape[0]}) or Approach ({apr.shape[0]}) curve too short after cropping.")
+            # Allow to proceed if at least one is somewhat valid, but might fail later.
+            # If both are critically short, then fail.
+            if dfl.shape[0] < 5 and apr.shape[0] < 5:
+                return None, None, False
+
+        # *************************************************************
+        # Remove offsets to obtain true 0 - Primarily for Retraction (dfl)
+        # *************************************************************
+        retract_processed_final = None
+        if dfl.shape[0] > 5:  # Need some points to process
+            dfl_cur = np.flip(dfl[:, 1])  # Flipped deflection values from dfl
+            dfl_cur = np.abs(dfl_cur)
+            am_dfl = len(dfl_cur)
+
+            # Initial estimate for baseline (yo) and noise (ystd) from the first half of flipped dfl
+            idx_half_dfl = max(1, int(am_dfl / 2))  # Ensure at least 1 point
+            yo_dfl_baseline = np.mean(dfl_cur[:idx_half_dfl])
+            ystd_dfl_baseline = np.std(dfl_cur[:idx_half_dfl])
+
+            # Find "flat region" start (xo_dfl_offset_ext) in dfl based on deviation from baseline
+            # xo_dfl_offset_ext is the extension value from 'dfl' where significant force starts
+            xo_dfl_offset_ext = dfl[0, 0]  # Default to first extension point if no flat region found
+            flat_region_idx_dfl = 0  # Index in 'dfl_cur' (flipped, so corresponds to end of 'dfl')
+
+            for i in range(am_dfl):
+                if dfl_cur[i] >= (6 * ystd_dfl_baseline) + yo_dfl_baseline:
+                    # dfl_cur is flipped dfl[:,1]. So index 'i' in dfl_cur corresponds to 'am_dfl-1-i' in dfl.
+                    # dfl's original extension values are in dfl[:,0]
+                    xo_dfl_offset_ext = dfl[am_dfl - 1 - i, 0]
+                    flat_region_idx_dfl = i  # This 'i' is from start of dfl_cur
+                    break
+
+            # Refine baseline using the identified flat region (more accurate yo_dfl_true_offset)
+            # The flat region in dfl_cur is from index 0 to flat_region_idx_dfl-1
+            # This corresponds to the tail end of the original 'dfl' curve.
+            if flat_region_idx_dfl > 0:
+                yo_dfl_true_offset_calc_region = dfl_cur[:flat_region_idx_dfl]
+            else:  # No clear flat region found, use initial estimate or last few points of dfl
+                # Using the end of 'dfl' (which is start of 'dfl_cur')
+                num_tail_pts = max(1, min(20, am_dfl // 2))  # Use up to 20 points or half, for baseline
+                yo_dfl_true_offset_calc_region = dfl_cur[:num_tail_pts]
+
+            if yo_dfl_true_offset_calc_region.size > 0:
+                yo_dfl_true_offset = np.mean(yo_dfl_true_offset_calc_region)  # This is the force offset for dfl
+            else:  # Fallback if region is empty
+                yo_dfl_true_offset = yo_dfl_baseline
+
+            # Bias corrected dfl data -> dfln
+            # dfln will have [original_extension - xo_dfl_offset_ext, original_force - yo_dfl_true_offset]
+            # However, the MATLAB code uses 'xo' from approach curve for dfl bias. Let's re-check snippet.
+            # Snippet: `bias = np.column_stack((np.ones(md) * xo, np.ones(md) * yo))`
+            # `xo` is from approach curve processing, `yo` seems to be from `dfl` processing here. This is a bit mixed.
+            # Let's assume `xo_contact_point_ext` is determined from the approach curve for separation alignment.
+            # And `yo_dfl_true_offset` is the force offset for the retract curve.
+
+            # Find "knee point" (contact point extension) on approach curve (apr) for xo_contact_point_ext
+            xo_contact_point_ext = apr[0, 0] if apr.shape[0] > 0 else 0.0  # Default
+            yo_apr_baseline_offset = apr[0, 1] if apr.shape[0] > 0 else 0.0  # Default
+
+            if apr.shape[0] > 5:  # Process approach curve for its contact point
+                am_apr = apr.shape[0]
+                idx_half_apr = max(1, int(am_apr / 2))
+                yo_apr_init_baseline = np.mean(apr[:idx_half_apr, 1])
+                ystd_apr_init_baseline = np.std(apr[:idx_half_apr, 1])
+
+                flat_region_idx_apr = 0  # Index in 'apr'
+                for i in range(am_apr):
+                    # For approach, deviation is often a rise if force positive, or drop if negative.
+                    # Assuming positive force means contact. The snippet uses `<= (3*ystd)+yo`.
+                    # This means it looks for where the curve *enters* the baseline from contact.
+                    # For finding first contact, we should look from start of approach where it *leaves* baseline.
+                    # Let's adapt: look for force exceeding baseline + noise.
+                    if apr[i, 1] >= yo_apr_init_baseline + (3 * ystd_apr_init_baseline):  # Leaves baseline
+                        xo_contact_point_ext = apr[i, 0]
+                        flat_region_idx_apr = i  # This is the point of contact
+                        # The baseline force for approach should be taken before this point.
+                        actual_baseline_apr_region = apr[:flat_region_idx_apr, 1]
+                        if actual_baseline_apr_region.size > 0:
+                            yo_apr_baseline_offset = np.mean(actual_baseline_apr_region)
+                        else:  # No clear pre-contact baseline
+                            yo_apr_baseline_offset = yo_apr_init_baseline
+                        break
+                else:  # Loop completed without break, no clear contact found above baseline
+                    # Use initial part as baseline for force offset
+                    yo_apr_baseline_offset = yo_apr_init_baseline
+                    xo_contact_point_ext = apr[-1, 0] if apr.shape[0] > 0 else 0.0  # e.g. end of approach as 'contact'
+
+            # Apply bias correction to dfl (retract curve)
+            # Retract extension: dfl[:,0] - xo_contact_point_ext
+            # Retract force: dfl[:,1] - yo_dfl_true_offset
+            dfln_sep_component = dfl[:, 0] - xo_contact_point_ext
+            dfln_force_component = dfl[:, 1] - yo_dfl_true_offset
+
+            # *************************************************************
+            # Convert the data to Final Force (N) vs Separation (m) for Retract
+            # *************************************************************
+            # Force is directly from the bias-corrected, k_spring-scaled deflection
+            retract_force_final = dfln_force_component * k_spring
+
+            # Separation calculation from snippet: `force_p[:, 0] = -dfln[:, 0] + dfln[:, 1]`
+            # Here `dfln[:,0]` was `original_extension_from_dfl - xo_bias_from_apr`
+            # and `dfln[:,1]` was `original_force_from_dfl - yo_bias_from_dfl`
+            # This looks like: `-(ext_dfl - xo_apr) + (force_dfl - yo_dfl)`
+            # This doesn't seem like a standard separation calculation.
+            # Standard AFM: Separation = Z_piezo - Deflection_corrected_for_contact
+            # If dfl[:,0] is Z_piezo_retract and dfl[:,1] is Deflection_retract
+            # Then `dfln_sep_component` = Z_piezo_retract - Z_piezo_contact_from_approach
+            # And `dfln_force_component` = Deflection_retract - Deflection_baseline_retract
+            #
+            # The separation for WLC is usually tip-sample distance, often made positive.
+            # Let's use `retract_separation_final = dfln_sep_component`.
+            # The MATLAB `forceP(:,1) = dfln(:,1)-dfln(:,2);` where dfln was [ext,defl_offset_corrected]
+            # implied `separation = ext - defl_offset_corrected`.
+            # The Python snippet's `force_p[:,0] = -dfln[:,0] + dfln[:,1]` is different.
+            # Assuming `dfln_sep_component` (already Z_retract - Z_contact) is the extension-like part.
+            # And `dfln_force_component` is the deflection-like part for force.
+            #
+            # For WLC, we want positive extension. If `dfln_sep_component` represents Z movement away from contact,
+            # its sign might need flipping depending on coordinate system.
+            # The snippet's final separation: `Separation = Deflection_bias_corrected - Extension_bias_corrected`
+            # This is unusual. Let's assume `dfln_sep_component` represents the true tip-sample separation values.
+            # WLC typically uses positive extension values. If `dfln_sep_component` decreases during pulling,
+            # we might use `max(dfln_sep_component) - dfln_sep_component` or similar.
+            #
+            # Given the snippet `force_p[:, 0] = -dfln[:, 0] + dfln[:, 1]`, let's use it directly.
+            # `dfln[:,0]` here refers to `dfln_sep_component` conceptually.
+            # `dfln[:,1]` refers to `dfln_force_component` (before k_spring).
+            # This `dfln[:,1]` (deflection) is used in separation.
+            retract_separation_final = -dfln_sep_component + dfln_force_component  # As per snippet logic for separation component
+            # This combines extension and deflection.
+
+            retract_processed_temp = np.column_stack((retract_separation_final, retract_force_final))
+
+            # Downsample
+            if retract_processed_temp.shape[0] >= 2:
+                retract_processed_final = retract_processed_temp[::2, :]
+            elif retract_processed_temp.shape[0] == 1:  # Keep single point if only one
+                retract_processed_final = retract_processed_temp
+            else:  # Empty
+                retract_processed_final = np.empty((0, 2))
+        else:  # dfl too short
+            retract_processed_final = np.empty((0, 2))
+
+        # *************************************************************
+        # Process Approach curve (apr) similarly for consistency
+        # *************************************************************
+        approach_processed_final = None
+        if apr.shape[0] > 5:  # Need some points to process
+            # apr_force_component uses its own baseline (yo_apr_baseline_offset)
+            apr_force_component = apr[:, 1] - yo_apr_baseline_offset
+            # apr_sep_component uses the same contact point extension from approach processing
+            apr_sep_component = apr[:, 0] - xo_contact_point_ext
+
+            approach_force_final = apr_force_component * k_spring
+            # Applying similar logic for separation as per snippet's processing of dfln
+            approach_separation_final = -apr_sep_component + apr_force_component
+
+            approach_processed_temp = np.column_stack((approach_separation_final, approach_force_final))
+
+            if approach_processed_temp.shape[0] >= 2:
+                approach_processed_final = approach_processed_temp[::2, :]
+            elif approach_processed_temp.shape[0] == 1:
+                approach_processed_final = approach_processed_temp
+            else:
+                approach_processed_final = np.empty((0, 2))
+        else:  # apr too short
+            approach_processed_final = np.empty((0, 2))
+
+        success_flag = True
+        if (retract_processed_final is None or retract_processed_final.shape[0] == 0) and \
+                (approach_processed_final is None or approach_processed_final.shape[0] == 0):
+            success_flag = False  # Failed if both are empty
+            if self.diagnostics: print("Processing resulted in empty retract and approach curves.")
+
+        return retract_processed_final, approach_processed_final, success_flag
+
+    def _process_test(self, y_data, k_spr):
+        # *************************************************************
+        # Crop the retraction and approach curves
+        # *************************************************************
+        # Get dimensions of data
+        m, n = y_data.shape if len(y_data.shape) > 1 else (len(y_data), 1)
+
+        # If data is 1D, we need to adjust our approach
+        if n == 1:
+            # Simplified approach for 1D data
+            # We'll assume just a single force column
+            force_col = 0
+
+            # Threshold to detect retraction curve
+            m_max = np.max(y_data[:, force_col])
+            m_min = y_data[-1, force_col]
+            T = 0.6 * (m_max - m_min)  # Ad hoc threshold
+
+            # Extract retraction curve
+            dfl = []
+            for i in range(m - 1, -1, -1):
+                if (y_data[i, force_col] - m_min) > T:
+                    break
+                dfl.append([i / m, y_data[i, force_col]])  # Using index/m as a proxy for position
+
+            dfl = np.array(dfl)
+
+            # Extract approach curve
+            apr = []
+            for i in range(m):
+                if (y_data[i, force_col] - m_min) > T:
+                    break
+                apr.append([i / m, y_data[i, force_col]])
+
+            apr = np.array(apr)
         else:
-            baseline_force_offset_retract = 0.0
+            # Multi-column data - we use specific columns for deflection and extension
+            # In this case, columns should be:
+            # Column 0: Time or index
+            # Column 1: Deflection or force
+            # Column 2: Extension or separation
+            force_col = 1  # Deflection column
+            ext_col = 2  # Extension column
 
-        force_retract_corrected = force_retract - baseline_force_offset_retract
+            # Threshold to detect retraction curve
+            m_max = np.max(y_data[:, force_col])
+            m_min = y_data[-1, force_col]
+            M = m_max - m_min
+            T = 0.6 * M  # Ad hoc threshold
 
-        # For approach curve baseline: use the initial part
-        if len(force_approach) > 20:
-            baseline_force_offset_approach = np.mean(force_approach[:int(len(force_approach) * 0.2)])  # Use first 20%
-        elif len(force_approach) > 0:
-            baseline_force_offset_approach = np.mean(force_approach)
-        else:
-            baseline_force_offset_approach = 0.0
-        force_approach_corrected = force_approach - baseline_force_offset_approach
+            # Extract retraction curve (moving from end to start)
+            j = 0
+            breakpoint_index = 0
+            for i in range(m - 1, -1, -1):
+                j += 1
+                if (y_data[i, force_col] - m_min) > T:
+                    breakpoint_index = i
+                    break
 
-        # Contact point determination for separation offset
-        # A common method: find where the force on approach starts to deviate from baseline
-        # Or, find the point of maximum adhesion on retract (if present and significant)
-        # The MATLAB code has a more complex 'xo' finding logic.
-        # Simplified: use the point of maximum force on approach as contact.
-        # Or use the point where force_approach significantly deviates from zero.
+            dfl = np.zeros((j, 2))
+            k = 0
+            for i in range(breakpoint_index, m):
+                dfl[k, 0] = y_data[i, ext_col]  # Extension
+                dfl[k, 1] = y_data[i, force_col]  # Force/Deflection
+                k += 1
 
-        contact_point_sep_offset = 0.0
-        if len(force_approach_corrected) > 10:
-            # Find where approach force rises above noise (e.g., 3*std of baseline)
-            noise_level_approach = np.std(force_approach_corrected[:int(len(force_approach_corrected) * 0.2)])
-            contact_indices = np.where(np.abs(force_approach_corrected) > 3 * noise_level_approach)[0]
-            if len(contact_indices) > 0:
-                # First significant contact point on approach
-                contact_idx_approach = contact_indices[0]
-                contact_point_sep_offset = sep_approach[contact_idx_approach]
-            else:  # If no clear contact, use max force point on approach
-                contact_idx_approach = np.argmax(np.abs(force_approach_corrected))
-                contact_point_sep_offset = sep_approach[contact_idx_approach]
+            # Extract approach curve (moving from start to end)
+            j = 0
+            for i in range(m):
+                j += 1
+                if (y_data[i, force_col] - m_min) > T:
+                    breakpoint_index = i
+                    break
 
-        sep_retract_corrected = sep_retract - contact_point_sep_offset
-        sep_approach_corrected = sep_approach - contact_point_sep_offset
+            apr = np.zeros((j, 2))
+            k = 0
+            for i in range(j):
+                apr[k, 0] = y_data[i, ext_col]  # Extension
+                apr[k, 1] = y_data[i, force_col]  # Force/Deflection
+                k += 1
 
-        # Combine into [separation, force] arrays
-        # The MATLAB code processes `dfln` which is the retract curve.
-        # And `apr` which is the approach curve.
-        # We return the corrected retract and approach curves.
-        # Typically, WLC fitting is done on the retract curve.
+        # *************************************************************
+        # Remove offsets to obtain true 0
+        # *************************************************************
+        # This section handles baseline correction and identifies significant deflection points
 
-        # The MATLAB script uses `dfln` which is effectively the processed retract curve.
-        # `dfln(:,1)` is separation, `dfln(:,2)` is force.
-        # It also seems to use negative separation for plotting/fitting in some contexts.
-        # For WLC, extension (separation) is usually positive.
+        # Flip deflection for processing
+        dfl_cur = np.flip(dfl[:, 1])
+        dfl_cur = np.abs(dfl_cur)
+        am = len(dfl_cur)
 
-        # We want the retract curve for WLC analysis (pulling events)
-        # Ensure separation is generally increasing during "pulling" part of retract.
-        # AFM retract curves often start at high Z (large separation) and move to lower Z (smaller separation).
-        # We need to present extension (separation) as positive and increasing for WLC.
-        # The MATLAB 'dfln' seems to have separation values that can be negative after offset.
-        # Let's ensure our 'separation' for WLC is the extension from the contact point.
-        # If sep_retract_corrected is decreasing (as Z moves from max to min), we might need to flip it or use absolute values carefully.
+        # Calculate mean and std of initial portion (baseline)
+        yo = np.mean(dfl_cur[:int(am / 2)])
+        ystd = np.std(dfl_cur[:int(am / 2)])
 
-        # The MATLAB 'AnalyseForceCurves.m' does:
-        # forceP(:,1) = dfln(:,1)-dfln(:,2); % This is separation Z - deflection (already done for sep_retract)
-        # forceP(:,2) = dfln(:,2)*Kspr;    % This is force (already done for force_retract_corrected)
-        # Then `dfln = downsample(forceP, 4);`
-        # So, the `dfln` used for peak finding is [separation, force] from the retract curve.
+        # Find "flat region" where deflection starts to be significant
+        flat_region = 1
+        xo = 0
+        for i in range(am):
+            if dfl_cur[i] >= (6 * ystd) + yo:
+                xo = dfl[i, 0]
+                flat_region = i
+                break
 
-        # Let's ensure our `retract_processed` has separation increasing for typical WLC fitting.
-        # If sep_retract_corrected[0] > sep_retract_corrected[-1], it means separation decreases during retract.
-        # This is typical if Z moves from far to near.
-        # For WLC, we usually consider extension from a zero point.
-        # The MATLAB 'dflni' (region of interest) has separation values.
-        # And 'fData = -(roi{i}(:,2))', so force is made positive for WLC fitting.
+        # Repeat with more accurate flat region
+        yo = np.mean(dfl_cur[:flat_region])
+        ystd = np.std(dfl_cur[:flat_region])
 
-        retract_processed = np.column_stack(
-            (-sep_retract_corrected, force_retract_corrected))  # Make separation positive extension
-        approach_processed = np.column_stack((-sep_approach_corrected, force_approach_corrected))
+        flat_region = 1
+        for i in range(am):
+            if dfl_cur[i] >= (6 * ystd) + yo:
+                xo = dfl[i, 0]
+                flat_region = i
+                break
 
-        # Downsample, similar to MATLAB's `downsample(forceP, 4)`
-        # Downsampling factor - adjust as needed
-        ds_factor = 2  # MATLAB uses 4 for 'forceP' then later medfilt with 3 or 7
-        if len(retract_processed) > ds_factor * 10:  # Only downsample if enough points
-            retract_processed = retract_processed[::ds_factor, :]
-        if len(approach_processed) > ds_factor * 10:
-            approach_processed = approach_processed[::ds_factor, :]
+        # Calculate final baseline values
+        yo = np.mean(dfl[am - flat_region + 100:, 1]) if am - flat_region + 100 < am else np.mean(dfl[-20:, 1])
+        ystd = np.std(dfl[am - flat_region + 100:, 1]) if am - flat_region + 100 < am else np.std(dfl[-20:, 1])
 
-        return retract_processed, approach_processed, True
+        yo_dfl = yo
+        ystd_dfl = ystd
 
-    def _find_regions_of_interest(self, force_curve_data, k_spring):
+        # Find "knee point" on approach curve
+        am, _ = apr.shape
+        yo = np.mean(apr[:int(am / 2), 1])
+        ystd = np.std(apr[:int(am / 2), 1])
+
+        flat_region = 1
+        for i in range(am):
+            if apr[i, 1] <= (3 * ystd) + yo:
+                xo = apr[i, 0]
+                flat_region = i
+
+        # Repeat with more accurate flat region
+        yo = np.mean(apr[:flat_region, 1])
+        ystd = np.std(apr[:flat_region, 1])
+
+        flat_region = 1
+        for i in range(am):
+            if apr[i, 1] <= (3 * ystd) + yo:
+                xo = apr[i, 0]
+                flat_region = i
+
+        # Bias corrected data
+        md, _ = dfl.shape
+        bias = np.column_stack((np.ones(md) * xo, np.ones(md) * yo))
+
+        dfln = dfl - bias  # Data with true 0
+
+        # *************************************************************
+        # Convert the data to Force (N) vs Separation (m)
+        # *************************************************************
+        force_p = np.zeros_like(dfln)
+        force_p[:, 1] = dfln[:, 1] * k_spr  # Convert deflection to force
+        force_p[:, 0] = -dfln[:, 0] + dfln[:, 1]  # Calculate true separation
+
+        # Downsample to reduce noise and computational load
+        dfln = force_p[::2]  # Take every 4th point
+        return dfln, None, 1
+
+    def _find_regions_of_interest_matlab(self, force_curve_data, k_spring):
         """
         Identifies regions of interest (potential unfolding events) in the force curve.
-        This is a complex part of the MATLAB script involving peak finding, prominence,
-        and curvature analysis. This Python version will be a simplified adaptation.
+        Implementation based on the MATLAB code for identifying regions with significant
+        force changes that can be fit with WLC model.
 
         Parameters:
         force_curve_data (np.array): Processed force curve [separation (m), force (N)].
                                      Typically the retract curve.
-        k_spring (float): Cantilever spring constant (N/m), used for context if needed.
+        k_spring (float): Cantilever spring constant (N/m), used for threshold calculations.
 
         Returns:
         list: A list of np.arrays, where each array is an ROI [separation (m), force (N)].
         """
-        rois = []
+        # Check if we have enough data
         if force_curve_data is None or len(force_curve_data) < 20:
-            return rois
+            return []
 
-        separation = force_curve_data[:, 0]
-        force = force_curve_data[:, 1]
+        # Extract separation and force
+        dfln = force_curve_data
 
-        # Apply a median filter to smooth the force data, similar to MATLAB's medfilt1
-        # The MATLAB script uses medfilt1(dfln(:,2), 7) for initial peak finding (dfln_f)
-        # and then medfilt1(dflni(:,2), 3) for ROIs (dflni_f)
-        force_filtered = signal.medfilt(force, kernel_size=5)  # Kernel size can be tuned
+        # Apply median filter for initial peak detection
+        dfln_f = np.zeros_like(dfln)
+        dfln_f[:, 0] = dfln[:, 0]
+        dfln_f[:, 1] = signal.medfilt(dfln[:, 1], kernel_size=7)
 
-        # Find peaks (representing rupture events or feature detachments)
-        # The MATLAB script looks for valleys in deflection (npksf), then uses their prominences.
-        # Here, we'll look for peaks in force if force is positive during pulling.
-        # If your force signal is negative during pulling, you'd find peaks in -force.
-        # Assuming positive force for pulling events:
+        # Find peaks (positive peaks) - these represent locations where force increases
+        try:
+            locs, _ = signal.find_peaks(dfln_f[:, 1], distance=10)
+            if len(locs) > 0:
+                # Calculate peak prominences
+                p = signal.peak_prominences(dfln_f[:, 1], locs)[0]
+            else:
+                p = np.array([])
+        except Exception as e:
+            print(f"Error finding positive peaks: {e}")
+            locs = np.array([])
+            p = np.array([])
 
-        # Parameters for peak finding (can be tuned)
-        # min_peak_height = np.std(force_filtered) # Example: force must be at least 1 std dev
-        # min_peak_prominence = np.std(force_filtered) * 0.5 # Example: prominence
-        # min_peak_distance = int(0.05 * len(force_filtered)) # Min distance between peaks (e.g., 5% of curve length)
+        # Find valleys (negative peaks) - these represent locations where force decreases
+        try:
+            neg_locs, _ = signal.find_peaks(-dfln_f[:, 1], distance=20)
+            if len(neg_locs) > 0:
+                # Calculate valley prominences
+                np_vals = signal.peak_prominences(-dfln_f[:, 1], neg_locs)[0]
+            else:
+                np_vals = np.array([])
+        except Exception as e:
+            print(f"Error finding negative peaks: {e}")
+            neg_locs = np.array([])
+            np_vals = np.array([])
 
-        # A simpler approach than the full MATLAB peak analysis:
-        # Look for significant "sawtooth" patterns. A peak followed by a drop.
-        # The MATLAB script uses `findpeaks` on force `pks, locs` and on negative force `npks, nlocs`
-        # Then it combines these to find regions `allroi`.
-        # `checkDiff == 2` implies a sequence of positive peak then negative peak (or vice-versa in their logic).
+        if self.diagnostics:
+            print(f"Found {len(locs)} positive peaks and {len(neg_locs)} negative peaks")
 
-        # Let's try to find "unfolding" peaks directly in the force.
-        # These are typically sharp drops after a rise in force.
-        # So, we are looking for peaks in force, and the region before the peak is the WLC segment.
+        # Apply a second, milder median filter for detailed analysis (like dflni_f in MATLAB)
+        dflni = dfln.copy()  # Start with the original data
+        dflni_f = np.zeros_like(dflni)
+        dflni_f[:, 0] = dflni[:, 0]
+        dflni_f[:, 1] = signal.medfilt(dflni[:, 1], kernel_size=3)
 
-        # Find significant positive peaks in the filtered force data.
-        # These peaks often mark the point of rupture or full extension of a domain.
-        # The region leading up to the peak is what we fit with WLC.
+        # Calculate noise level from approach curve or baseline (assumed passed separately in MATLAB)
+        # For now, estimate from initial part of the curve
+        yfstd = np.std(dflni_f[:min(20, len(dflni_f)), 1])
 
-        # Adjust these based on typical force values (e.g., tens to hundreds of pN)
-        # height_threshold_N = 20e-12 # Minimum height of a peak in Newtons (e.g., 20 pN)
-        # prominence_threshold_N = 15e-12 # Minimum prominence in Newtons
+        # Find important peaks based on prominence/median(prominences) like in MATLAB
+        # Threshold values as in MATLAB
+        t_pp = 7  # Threshold for positive peaks' prominence
+        t_np = 7  # Threshold for negative peaks' prominence
 
-        # Use relative thresholds based on data noise/scale
-        noise_level = np.std(force_filtered[:len(force_filtered) // 5])  # Estimate noise from initial part
-        height_threshold_N = max(5e-12, 3 * noise_level)  # e.g., 5 pN or 3x noise
-        prominence_threshold_N = max(5e-12, 2 * noise_level)
-        min_dist_points = 10  # Minimum number of data points between peaks
+        # Select important peaks based on prominence
+        locs_imp = []
+        if len(p) > 0:
+            med_p = np.median(p)
+            for i in range(len(p)):
+                if p[i] > t_pp * med_p:
+                    locs_imp.append(locs[i])
 
-        peak_indices, properties = signal.find_peaks(force_filtered,
-                                                     height=height_threshold_N,
-                                                     prominence=prominence_threshold_N,
-                                                     distance=min_dist_points)
+        # Select important valleys based on prominence
+        nlocs_imp = []
+        if len(np_vals) > 0:
+            med_np = np.median(np_vals)
+            for i in range(len(np_vals)):
+                if np_vals[i] > t_np * med_np:
+                    nlocs_imp.append(neg_locs[i])
 
-        if self.diagnostics and len(peak_indices) > 0:
-            print(f"Found {len(peak_indices)} potential rupture peaks.")
-            if self.make_plots:
+        if self.diagnostics:
+            print(f"Selected {len(locs_imp)} important positive peaks")
+            print(f"Selected {len(nlocs_imp)} important negative peaks")
+
+        # Interlace positive and negative important peaks to identify regions
+        all_roi = []
+
+        # Create a list of [location, type] where type=1 for positive peak, type=-1 for negative peak
+        all_imp_locs = []
+        for loc in locs_imp:
+            all_imp_locs.append([loc, 1])
+        for loc in nlocs_imp:
+            all_imp_locs.append([loc, -1])
+
+        # Sort by location
+        all_imp_locs = sorted(all_imp_locs, key=lambda x: x[0])
+
+        # Following MATLAB's logic for identifying ROIs
+        roi = []
+        for i in range(len(all_imp_locs) - 1):
+            loc1 = all_imp_locs[i][0]
+            loc2 = all_imp_locs[i + 1][0]
+            check_diff = all_imp_locs[i][1] - all_imp_locs[i + 1][1]
+
+            # MATLAB looks for checkDiff == 2 which means pos peak followed by neg peak
+            if check_diff == 2:
+                # Check if pk-pk distance is greater than threshold (like MATLAB)
+                roi_data = dflni[loc1:loc2, :]
+                roi_len = len(roi_data)
+
+                if roi_len > 5:  # Ensure ROI has enough points
+                    roi_pp = abs(roi_data[0, 1] - roi_data[-1, 1])
+                    # MATLAB uses yfstd * 4 * Kspr for threshold
+                    roi_thresh = yfstd * 4 * k_spring
+
+                    if roi_pp > roi_thresh:
+                        all_roi.append(roi_data)
+
+        # Logic as in MATLAB for final roi selection
+        if len(all_imp_locs) > 0 and all_imp_locs[0][1] == 1 and len(all_roi) >= 2:
+            roi = all_roi[1:-1]
+        else:
+            roi = all_roi[:-1] if len(all_roi) > 0 else all_roi
+
+        if self.diagnostics:
+            print(f"Identified {len(roi)} regions of interest")
+            if self.make_plots and len(roi) > 0:
                 plt.figure(figsize=(10, 6))
-                plt.plot(separation, force, 'c-', label='Raw Force')
-                plt.plot(separation, force_filtered, 'b-', label='Filtered Force')
-                plt.plot(separation[peak_indices], force_filtered[peak_indices], "rx", label="Detected Peaks")
+                plt.plot(dflni[:, 0], dflni[:, 1], 'c-', label='Processed Force')
+                plt.plot(dflni_f[:, 0], dflni_f[:, 1], 'b-', label='Filtered Force')
+
+                if len(locs_imp) > 0:
+                    plt.plot(dflni[locs_imp, 0], dflni[locs_imp, 1], "rs", label="Important Peaks")
+
+                if len(nlocs_imp) > 0:
+                    plt.plot(dflni[nlocs_imp, 0], dflni[nlocs_imp, 1], "bs", label="Important Valleys")
+
+                # Plot all ROIs
+                roi_combined = np.vstack(roi) if len(roi) > 0 else np.array([])
+                if len(roi_combined) > 0:
+                    plt.plot(roi_combined[:, 0], roi_combined[:, 1], "rx", label="ROI Points")
+
                 plt.xlabel("Separation (m)")
                 plt.ylabel("Force (N)")
-                plt.title("Peak Detection for ROI Identification")
+                plt.title("Regions of Interest for WLC Fitting")
                 plt.legend()
                 plt.show()
 
-        # Define ROIs: from the valley before a peak up to the peak.
-        # The MATLAB code uses `allImpLocs` with +1 and -1 to mark peak/valley types.
-        # `checkDiff == 2` means `locs_imp` (positive peak) then `nlocs_imp` (negative peak/valley).
-        # This corresponds to an unfolding event: force rises (to locs_imp), then drops (to nlocs_imp).
-        # The ROI is dflni(loc1:loc2), where loc1 is the start of the rise, loc2 is the peak.
-
-        # Simplified ROI: Segment before each peak.
-        # We need to find the start of the rise for each peak.
-        # This could be the previous valley or where force starts to rise significantly.
-
-        # For each peak, find the preceding valley (local minimum).
-        last_valley_idx = 0
-        for pk_idx in peak_indices:
-            # Search for a valley (local minimum) in the segment before this peak and after the last valley/ROI end.
-            search_segment_force = force_filtered[last_valley_idx:pk_idx]
-            if len(search_segment_force) < 5:  # Too short to find a distinct valley
-                start_idx_roi = last_valley_idx
-            else:
-                # Find minima in the negative of the search segment
-                valley_indices_in_segment, _ = signal.find_peaks(-search_segment_force,
-                                                                 prominence=prominence_threshold_N * 0.5)
-                if len(valley_indices_in_segment) > 0:
-                    # The last valley before the peak in this segment
-                    current_valley_idx_in_segment = valley_indices_in_segment[-1]
-                    start_idx_roi = last_valley_idx + current_valley_idx_in_segment
-                else:  # No clear valley, start from the end of the last ROI or a bit before the peak
-                    start_idx_roi = max(last_valley_idx, pk_idx - int(min_dist_points * 1.5))  # Fallback
-
-            end_idx_roi = pk_idx  # End ROI at the peak
-
-            # Ensure ROI has a minimum length and shows a force increase
-            if end_idx_roi > start_idx_roi + 5 and \
-                    force_filtered[end_idx_roi] > force_filtered[start_idx_roi] + prominence_threshold_N * 0.5:
-
-                current_roi_data = force_curve_data[start_idx_roi:end_idx_roi + 1, :]
-
-                # Filter ROI by an approximate force threshold (e.g., > 5 pN) to remove baseline noise segments
-                # This is a simple filter; the MATLAB one is more sophisticated.
-                min_force_for_roi = 5e-12  # 5 pN
-                if np.max(current_roi_data[:, 1]) > min_force_for_roi:
-                    rois.append(current_roi_data)
-
-            last_valley_idx = end_idx_roi  # Next search starts after this peak
-
-        if self.diagnostics:
-            print(f"Identified {len(rois)} ROIs.")
-        return rois
+        return roi
 
     def analyze_single_curve(self, ibw_file_path):
         """
@@ -472,11 +797,12 @@ class ForceCurveAnalyzer:
         ibw_file_path (str): Path to the .ibw file.
 
         Returns:
-        tuple: (all_wlc_fits, all_wlc_params, fig_handle)
+        tuple: (all_wlc_fits, all_wlc_params, processed_curve, fig_handle)
                all_wlc_fits (list): List of WLC fit data arrays for each successful ROI.
                                     Each array is [separation (m), fitted_force (N)].
                all_wlc_params (list): List of dictionaries, each containing parameters
                                       for a successful WLC fit (Lc, P, rupture_L, rupture_F, fit_quality_percent, velocity).
+               processed_curve (list): First row is Separation, Second row is Force
                fig_handle (matplotlib.figure.Figure or None): Handle to the generated plot if make_plots is True.
         """
         all_wlc_fits = []
@@ -492,7 +818,7 @@ class ForceCurveAnalyzer:
         wave_data = igor_wave['wave']['wData']
         try:
             wave_notes_bytes = igor_wave['wave']['note']
-            wave_notes = wave_notes_bytes.decode('utf-8', errors='ignore')
+            wave_notes = str(wave_notes_bytes)
         except Exception as e:
             if self.diagnostics: print(f"Could not decode wave notes for {ibw_file_path}: {e}. Using empty notes.")
             wave_notes = ""
@@ -502,14 +828,14 @@ class ForceCurveAnalyzer:
 
         # Process raw data to get force-separation curves (retract and approach)
         # We primarily use the retract curve for WLC fitting of unfolding events.
-        retract_curve_processed, approach_curve_processed, success = self._process_raw_curve_data(wave_data, k_spring)
+        retract_curve_processed, approach_curve_processed, success = self._process_test(wave_data, k_spring)
 
         if not success or retract_curve_processed is None or len(retract_curve_processed) == 0:
             print(f"Failed to process raw data for {ibw_file_path}.")
             return all_wlc_fits, all_wlc_params, fig_handle
 
         # Identify ROIs from the processed retract curve
-        rois = self._find_regions_of_interest(retract_curve_processed, k_spring)
+        rois = self._find_regions_of_interest_matlab(retract_curve_processed, k_spring)
 
         if not rois:
             if self.diagnostics: print(f"No regions of interest found in {ibw_file_path}.")
@@ -526,7 +852,7 @@ class ForceCurveAnalyzer:
                 plt.title(f"Processed Force Curve: {os.path.basename(ibw_file_path)} (No ROIs)")
                 plt.legend()
                 plt.grid(True)
-            return all_wlc_fits, all_wlc_params, fig_handle
+            return all_wlc_fits, all_wlc_params, retract_curve_processed, fig_handle
 
         # Perform WLC fitting for each ROI
         for i, roi_data in enumerate(rois):
@@ -667,7 +993,7 @@ class ForceCurveAnalyzer:
             plt.tight_layout()
             # plt.show() # Show plot immediately, or let the calling function handle it.
 
-        return all_wlc_fits, all_wlc_params, fig_handle
+        return all_wlc_fits, all_wlc_params, retract_curve_processed, fig_handle
 
     def batch_process_ibw_files(self, directory_path, output_summary_file="wlc_fit_summary.csv"):
         """
@@ -690,7 +1016,7 @@ class ForceCurveAnalyzer:
             file_path = os.path.join(directory_path, filename)
             print(f"\nProcessing: {filename}...")
 
-            wlc_fits, wlc_params_list, fig = self.analyze_single_curve(file_path)
+            wlc_fits, wlc_params_list, processed_curve, fig = self.analyze_single_curve(file_path)
 
             if wlc_params_list:
                 print(f"Successfully fitted {len(wlc_params_list)} WLC regions for {filename}.")
@@ -742,7 +1068,7 @@ if __name__ == "__main__":
     TEMPERATURE_K = 298.15  # Experimental temperature in Kelvin (e.g., 25°C)
     FIT_THRESHOLD = 70.0  # Minimum fit quality percentage for a WLC fit to be considered good
     GENERATE_PLOTS = True  # Set to True to see and save plots for each curve
-    ENABLE_DIAGNOSTICS = False  # Set to True for verbose output during processing
+    ENABLE_DIAGNOSTICS = True  # Set to True for verbose output during processing
 
     # --- Create Analyzer Instance ---
     analyzer = ForceCurveAnalyzer(

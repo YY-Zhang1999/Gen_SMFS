@@ -1,0 +1,17 @@
+/your_project_root/
+├── raw_data/                     # Original .ibw files
+│   └── YY-MM-DD/
+│       ├── Experiment_config.txt
+│       └── file2.ibw
+│       └── file2.ibw
+├── processed_data/
+│   └── YYYY-MM-DD_ExperimentA/     # Mirroring raw_data structure
+│       ├── file1_curve_id_XXX/     # A folder for each processed .ibw file
+│       │   ├── file1_curve_id_XXX_processed.h5  # Contains processed_curve, wlc_fits, wlc_params_list
+│       │   └── file1_curve_id_XXX_analysis_figure.png
+│       └── file2_curve_id_YYY/
+│           ├── file2_curve_id_YYY_processed.h5
+│           └── file2_curve_id_YYY_analysis_figure.png
+└── metadata/
+    └── experiment_summary.csv      # Master metadata file
+    └── Cailong_experiment_config.txt # Original config, copied for reference
