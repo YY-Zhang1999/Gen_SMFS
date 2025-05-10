@@ -21,6 +21,48 @@ except ImportError:
     logging.warning("Could not import utils.py directly. Ensure src.data_processing is in PYTHONPATH.")
     from utils import calculate_contour_length, load_raw_data
 
+def read_simulation_data(df_save_path, clustering_no, speed=500):
+    """
+    Reads simulation data files generated from molecular simulations
+
+    Args:
+        df_save_path (str): Path where data files are stored
+        clustering_no (str): Clustering identifier used in filenames
+        speed (int): Speed in nm/s used in simulation
+
+    Returns:
+        tuple: (Fu_data_df, xp_data_df, WLC_data_df) - DataFrames containing force,
+               extension, and worm-like chain parameter data
+    """
+    # Construct file paths
+    fu_file = f"{df_save_path}clustering_Fu_{clustering_no}_sim_speed_{speed}_data.csv"
+    xp_file = f"{df_save_path}clustering_xp_{clustering_no}_sim_speed_{speed}_data.csv"
+    wlc_file = f"{df_save_path}clustering_WLC_data_{clustering_no}_sim_speed_{speed}_data.csv"
+
+    # Read data files
+    try:
+        Fu_data_df = pd.read_pickle(fu_file)
+        print(f"Successfully loaded force data from {fu_file}")
+    except FileNotFoundError:
+        print(f"Force data file not found: {fu_file}")
+        Fu_data_df = None
+
+    try:
+        xp_data_df = pd.read_pickle(xp_file)
+        print(f"Successfully loaded extension data from {xp_file}")
+    except FileNotFoundError:
+        print(f"Extension data file not found: {xp_file}")
+        xp_data_df = None
+
+    try:
+        WLC_data_df = pd.read_pickle(wlc_file)
+        print(f"Successfully loaded WLC parameter data from {wlc_file}")
+    except FileNotFoundError:
+        print(f"WLC data file not found: {wlc_file}")
+        WLC_data_df = None
+
+    return Fu_data_df, xp_data_df, WLC_data_df
+
 
 def read_simulation_data(df_save_path, clustering_no, speed=500):
     """
