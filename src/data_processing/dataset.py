@@ -122,9 +122,12 @@ class FEDataset(Dataset):
         self.has_conditions = True
         if conditions_path:
             try:
-                self.conditions_df = pd.read_csv(conditions_path)
-                # Assuming all columns in the conditions file are numerical conditions
-                self.conditions = self.conditions_df.values
+                if conditions_path.endswith('.csv'):
+                    self.conditions_df = pd.read_csv(conditions_path)
+                    # Assuming all columns in the conditions file are numerical conditions
+                    self.conditions = self.conditions_df.values
+                else:
+                    self.conditions = np.load(conditions_path)
                 logging.info(f"Loaded conditions with shape: {self.conditions.shape}")
 
             except Exception as e:
@@ -135,11 +138,17 @@ class FEDataset(Dataset):
             self.conditions = None
 
         # Ensure all data sources have the same number of samples
-        if not (len(self.fe_curves) == len(self.sequences_df) == len(self.conditions_df)):
-            raise ValueError(f"Mismatch in number of samples across data files: "
-                             f"F-E curves ({len(self.fe_curves)}), "
-                             f"Sequences ({len(self.sequences_df)}), "
-                             f"Conditions ({len(self.conditions_df)})")
+        if self.has_sequences:
+            if not (len(self.fe_curves) == len(self.sequences_df) == len(self.conditions)):
+                raise ValueError(f"Mismatch in number of samples across data files: "
+                                 f"F-E curves ({len(self.fe_curves)}), "
+                                 f"Sequences ({len(self.sequences_df)}), "
+                                 f"Conditions ({len(self.conditions)})")
+        else:
+            if not (len(self.fe_curves) == len(self.conditions)):
+                raise ValueError(f"Mismatch in number of samples across data files: "
+                                 f"F-E curves ({len(self.fe_curves)}), "
+                                 f"Conditions ({len(self.conditions)})")
 
         self.num_samples = len(self.fe_curves)
         self.fe_curve_length = fe_curve_length  # Store the expected length

@@ -350,7 +350,7 @@ def encode_conditions(
         logging.error(f"Missing condition columns in DataFrame: {missing}")
         raise ValueError(f"Missing condition columns: {missing}")
 
-    conditions_data = conditions_df[condition_columns].values
+    conditions_data = conditions_df[condition_columns]
 
     # --- Add scaling or further encoding here if needed ---
     # Example: using StandardScaler from scikit-learn (requires installation)
@@ -359,8 +359,8 @@ def encode_conditions(
     conditions_data = scaler.fit_transform(conditions_data)
     # ------------------------------------------------------
 
-    logging.info(f"Conditions encoded with shape: {conditions_data.shape}")
-    return conditions_data.astype(np.float32)
+    logging.info(f"Conditions encoded with shape: {conditions_data.shape} and type {type(conditions_data)}")
+    return conditions_data
 
 
 # Example Usage (requires dummy raw data files to be created)

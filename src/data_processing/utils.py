@@ -89,7 +89,6 @@ def save_processed_data(data, file_path: str):
     if output_dir and not os.path.exists(output_dir):
         os.makedirs(output_dir, exist_ok=True)
         logging.info(f"Created output directory: {output_dir}")
-    print(type(data), isinstance(data, np.ndarray))
     try:
         if isinstance(data, pd.DataFrame) and file_path.endswith('.csv'):
             data.to_csv(file_path, index=False)

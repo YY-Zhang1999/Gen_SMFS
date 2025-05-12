@@ -56,17 +56,10 @@ def main(data_config_path: str, model_config_path: str, training_config_path: st
 
     processed_data_dir = data_paths.get('processed_data_dir')
     fe_curves_file = data_paths.get('processed_fe_curves_file', 'fe_curves.npy')
-    sequences_file = data_paths.get('processed_sequences_file', 'sequences.csv') # Or .npy
     conditions_file = data_paths.get('processed_conditions_file', 'conditions.npy') # Or .csv
 
     fe_curves_path = os.path.join(processed_data_dir, fe_curves_file)
-    sequences_path = os.path.join(processed_data_dir, sequences_file)
     conditions_path = os.path.join(processed_data_dir, conditions_file)
-
-    if not all([os.path.exists(fe_curves_path), os.path.exists(sequences_path), os.path.exists(conditions_path)]):
-         logging.error(f"Processed data files not found. Please run 'preprocess_data.py' first.")
-         logging.error(f"Missing file(s): {[f for f in [fe_curves_path, sequences_path, conditions_path] if not os.path.exists(f)]}")
-         sys.exit(1)
 
 
     # Determine condition_input_dim from data config
@@ -75,46 +68,6 @@ def main(data_config_path: str, model_config_path: str, training_config_path: st
          logging.error("condition_columns not specified in data_config.data_preprocessing.")
          sys.exit(1)
     model_cfg['condition_input_dim'] = len(condition_columns)
-
-    # Determine protein_input_dim based on encoding type if not 'raw'
-    seq_encoding_type = preprocessing_params.get('seq_encoding_type')
-    if seq_encoding_type is None:
-         logging.error("seq_encoding_type not specified in data_config.data_preprocessing.")
-         sys.exit(1)
-
-    if seq_encoding_type == 'pretrained_embeddings':
-         model_cfg['protein_input_dim'] = preprocessing_params.get('protein_input_dim')
-         if model_cfg['protein_input_dim'] is None:
-              logging.error("protein_input_dim must be specified in data_config.data_preprocessing for 'pretrained_embeddings'.")
-              sys.exit(1)
-    elif seq_encoding_type == 'onehot':
-         protein_input_dims_onehot = preprocessing_params.get('protein_input_dims_onehot')
-         if protein_input_dims_onehot is None or not isinstance(protein_input_dims_onehot, list) or len(protein_input_dims_onehot) != 2:
-              logging.error("protein_input_dims_onehot must be specified as a list [seq_len, alphabet_size] in data_config.data_preprocessing for 'onehot'.")
-              sys.exit(1)
-         # For a simple encoder that flattens one-hot, the input dim is the product
-         model_cfg['protein_input_dim'] = protein_input_dims_onehot[0] * protein_input_dims_onehot[1]
-         # Note: If your one-hot encoder is more complex (e.g., uses Conv/RNN),
-         # the input_dim might need to be passed differently or handled within the model config.
-         # For the current ProteinEncoder placeholder, it expects the flattened dim.
-         logging.warning(f"Using flattened one-hot dim {model_cfg['protein_input_dim']} as protein_input_dim.")
-
-    elif seq_encoding_type == 'raw':
-         model_cfg['protein_input_dim'] = None # Handled by PLM/tokenizer within the model
-         if model_cfg.get('protein_plm_name') is None or model_cfg.get('protein_plm_embed_dim') is None:
-              logging.error("protein_plm_name and protein_plm_embed_dim must be specified in model_config for 'raw' protein encoding type.")
-              sys.exit(1)
-    else:
-         logging.error(f"Unsupported seq_encoding_type: {seq_encoding_type}")
-         sys.exit(1)
-
-    # Need to ensure fe_curve_length and channels match between data and model configs
-    if model_cfg['fe_curve_length'] != preprocessing_params['fe_curve_length']:
-         logging.error("Model config 'fe_curve_length' must match data config 'fe_curve_length'.")
-         sys.exit(1)
-    if model_cfg['fe_curve_channels'] != preprocessing_params['fe_curve_channels']:
-         logging.error("Model config 'fe_curve_channels' must match data config 'fe_curve_channels'.")
-         sys.exit(1)
 
 
     # Create Dataset (assuming FEDataset can load the processed files)
@@ -127,9 +80,7 @@ def main(data_config_path: str, model_config_path: str, training_config_path: st
     # You will likely need to modify FEDataset or add a split logic here.
     full_dataset = FEDataset(
         fe_curves_path=fe_curves_path,
-        sequences_path=sequences_path,
         conditions_path=conditions_path,
-        seq_encoding_type=seq_encoding_type, # Pass encoding type to Dataset
         fe_curve_length=preprocessing_params['fe_curve_length']
     )
 
@@ -142,14 +93,6 @@ def main(data_config_path: str, model_config_path: str, training_config_path: st
 
     # Define collate_fn if needed (e.g., for raw sequence encoding)
     collate_fn = None
-    if seq_encoding_type == 'raw':
-         # Need a custom collate function to tokenize and pad raw sequences
-         # from data_processing.collate_fn import collate_fn_raw_seq # You need to create this file
-         # collate_fn = collate_fn_raw_seq
-         logging.warning("Using 'raw' sequence encoding requires a custom collate_fn for DataLoader.")
-         logging.warning("Default DataLoader collate will likely fail for list of strings.")
-         pass # Use default collate_fn which will fail unless handled
-
 
     # Create DataLoaders
     train_dataloader = DataLoader(
@@ -166,6 +109,8 @@ def main(data_config_path: str, model_config_path: str, training_config_path: st
         collate_fn=collate_fn,
         num_workers=os.cpu_count() // 2 or 1
     )
+
+    return
 
     # --- Model Initialization ---
     logging.info("Initializing model...")
@@ -233,15 +178,7 @@ def main(data_config_path: str, model_config_path: str, training_config_path: st
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train the Conditional Diffusion Model for F-E curve generation.")
-    parser.add_argument('--data_config', type=str, required=True,
-                        help='Path to the data configuration YAML file.')
-    parser.add_argument('--model_config', type=str, required=True,
-                        help='Path to the model configuration YAML file.')
-    parser.add_argument('--training_config', type=str, required=True,
-                        help='Path to the training configuration YAML file.')
-    parser.add_argument('--checkpoint', type=str, default=None,
-                        help='Optional path to a checkpoint file to resume training from.')
-    args = parser.parse_args()
-
-    main(args.data_config, args.model_config, args.training_config, args.checkpoint)
+    main('C:\\Users\\Yiyuan Zhang\\PycharmProjects\\pythonProject\\Gen_SMFS\\config\\simulation_data_config.yaml',
+         'C:\\Users\\Yiyuan Zhang\\PycharmProjects\\pythonProject\\Gen_SMFS\\config\\model_config.yaml',
+         'C:\\Users\\Yiyuan Zhang\\PycharmProjects\\pythonProject\\Gen_SMFS\\config\\training_config.yaml',
+         'C:\\Users\\Yiyuan Zhang\\PycharmProjects\\pythonProject\\Gen_SMFS\\results')
