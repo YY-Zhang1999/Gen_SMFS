@@ -51,8 +51,8 @@ def main(config_path: str):
          logging.error("fe_curve_length, seq_encoding_type, and condition_columns must be specified in data_preprocessing.")
          sys.exit(1)
 
-    raw_data_dir = data_config['raw_data_dir'] + '/simulation'
-    processed_data_dir = data_config['processed_data_dir'] + '/simulation'
+    raw_data_dir = data_config['raw_data_dir']
+    processed_data_dir = data_config['processed_data_dir']
     os.makedirs(processed_data_dir, exist_ok=True)
 
     # --- Load Raw Data ---
@@ -102,6 +102,10 @@ def main(config_path: str):
 
     # Convert list of arrays to a single numpy array for saving
     processed_fe_curves_array = np.array(processed_fe_curves_list)
+    processed_fe_curves_array = np.nan_to_num(processed_fe_curves_array, nan=0.0)
+
+    if len(processed_fe_curves_array.shape) <= 2:
+        processed_fe_curves_array = np.expand_dims(processed_fe_curves_array, -1)
 
 
     # --- Encode Conditions ---
@@ -115,7 +119,11 @@ def main(config_path: str):
         # Add scaling parameters if implemented in encode_conditions
     )
 
-    print(type(processed_conditions_array))
+    if len(processed_conditions_array.shape) <= 2:
+        processed_conditions_array = np.expand_dims(processed_conditions_array, -1)
+
+    print(processed_conditions_array.shape, processed_fe_curves_array.shape)
+
 
     # --- Save Processed Data ---
     processed_fe_curves_path = os.path.join(processed_data_dir, data_config.get('processed_fe_curves_file', 'fe_curves.npy'))

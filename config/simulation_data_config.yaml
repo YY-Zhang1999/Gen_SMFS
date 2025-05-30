@@ -4,10 +4,10 @@
 
 data_paths:
   # Directory for raw data files (e.g., CSVs from experiments/simulations)
-  raw_data_dir: D:/PYTHON/project/Gen_SMFS/data/raw
+  raw_data_dir: D:/PYTHON/project/Gen_SMFS/data/raw/simulation
 
   # Directory for processed data files (ready for dataset loading)
-  processed_data_dir: D:/PYTHON/project/Gen_SMFS/data/processed
+  processed_data_dir: D:/PYTHON/project/Gen_SMFS/data/processed/simulation
 
   # File names for processed data (relative to processed_data_dir)
   processed_fe_curves_file: fe_curves.npy

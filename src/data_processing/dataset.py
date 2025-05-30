@@ -15,8 +15,14 @@ class FEDataset(Dataset):
 
     Assumes data has been preprocessed and stored in specified file formats.
     """
-    def __init__(self, fe_curves_path: str, sequences_path: str = None, conditions_path: str = None,
-                 seq_encoding_type: str = 'onehot', fe_curve_length: int = 1000):
+    def __init__(self,
+                 fe_curves_path: str,
+                 device: torch.device,
+                 sequences_path: str = None,
+                 conditions_path: str = None,
+                 seq_encoding_type: str = 'onehot',
+                 fe_curve_length: int = 1000,
+                 ):
         """
         Initializes the FEDataset.
 
@@ -32,6 +38,8 @@ class FEDataset(Dataset):
                                      (Future: add support for loading raw sequences for PLM encoding)
             fe_curve_length (int): The fixed length of the F-E curve vectors after preprocessing.
         """
+        self.device = device
+
         if not os.path.exists(fe_curves_path):
             raise FileNotFoundError("Force-extension data files do not exist.")
         if sequences_path and not os.path.exists(sequences_path):
@@ -62,6 +70,9 @@ class FEDataset(Dataset):
                  logging.warning(f"Loaded F-E curves have length {self.fe_curves.shape[1]}, expected {fe_curve_length}. Please check preprocessing.")
             elif isinstance(self.fe_curves, list) and len(self.fe_curves) > 0 and len(self.fe_curves[0]) != fe_curve_length:
                  logging.warning(f"Loaded F-E curves have length {len(self.fe_curves[0])}, expected {fe_curve_length}. Please check preprocessing.")
+
+            # Convert numpy array to tensor
+            self.fe_curves = torch.as_tensor(self.fe_curves, dtype=torch.float32, device=device)
 
 
         except Exception as e:
@@ -125,10 +136,12 @@ class FEDataset(Dataset):
                 if conditions_path.endswith('.csv'):
                     self.conditions_df = pd.read_csv(conditions_path)
                     # Assuming all columns in the conditions file are numerical conditions
-                    self.conditions = self.conditions_df.values
+                    self.conditions = np.array(self.conditions_df.values)
                 else:
                     self.conditions = np.load(conditions_path)
                 logging.info(f"Loaded conditions with shape: {self.conditions.shape}")
+
+                self.conditions = torch.as_tensor(self.conditions, dtype=torch.float32, device=device)
 
             except Exception as e:
                 logging.error(f"Error loading conditions from {conditions_path}: {e}")
@@ -182,16 +195,15 @@ class FEDataset(Dataset):
             fe_curve = np.array(fe_curve)
 
         # Ensure the F-E curve is a numpy array of the expected shape (fe_curve_length,)
-        if fe_curve.shape != (self.fe_curve_length,):
+        if fe_curve.shape[0] != self.fe_curve_length:
              # Attempt to reshape if necessary, but this indicates a preprocessing issue
-             logging.warning(f"F-E curve at index {idx} has shape {fe_curve.shape}, expected ({self.fe_curve_length},). Attempting reshape.")
+             logging.warning(f"F-E curve at index {idx} has shape {fe_curve.shape}, "
+                             f"expected ({self.fe_curve_length},). Attempting reshape.")
              try:
-                 fe_curve = fe_curve.reshape(self.fe_curve_length)
+                 fe_curve = fe_curve.reshape((self.fe_curve_length, 1))
              except ValueError:
-                 raise ValueError(f"Cannot reshape F-E curve at index {idx} with shape {fe_curve.shape} to ({self.fe_curve_length},). Check preprocessing.")
-
-
-        fe_curve_tensor = torch.as_tensor(fe_curve, dtype=torch.float32)
+                 raise ValueError(f"Cannot reshape F-E curve at index {idx} with shape {fe_curve.shape} "
+                                  f"to ({self.fe_curve_length},). Check preprocessing.")
 
         if self.has_sequences:
             if self.seq_encoding_type == 'raw':
@@ -209,14 +221,13 @@ class FEDataset(Dataset):
             sequence_tensor = torch.ones(1)
 
         if self.has_conditions:
-            conditions = self.conditions[idx]
-            conditions_tensor = torch.as_tensor(conditions, dtype=torch.float32)
+            conditions_tensor = self.conditions[idx]
         else:
-            conditions_tensor = torch.ones(1)
+            conditions_tensor = torch.ones(1, device=self.device)
 
 
         sample = {
-            'fe_curve': fe_curve_tensor,
+            'fe_curve': fe_curve,
             'sequence_data': sequence_tensor, # Renamed to be more general for raw strings
             'conditions': conditions_tensor
         }

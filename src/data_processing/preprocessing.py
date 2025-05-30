@@ -243,7 +243,6 @@ def preprocess_fe_curves(
             # You might also consider normalizing force by the peak force *of that curve*
             # if capturing relative changes is more important than absolute force values.
             # This would require calculating max force per curve.
-
             processed_curve = standardize_fe_curve(
                 extension,
                 force,

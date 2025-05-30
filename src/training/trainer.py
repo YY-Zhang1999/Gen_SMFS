@@ -1,40 +1,279 @@
-# src/training/trainer.py
-
 import torch
 import torch.nn as nn
-import torch.optim as optim
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter # For logging
 import os
 import time
-import json
 import logging
-from typing import Dict, Any, Union, List
+from typing import Dict, Any, Union, List, Tuple # Added Tuple
+from abc import ABC, abstractmethod # For abstract base class
 
-# Import necessary modules from your project
-try:
-    from models.diffusion_model import ConditionalDiffusionModel
-    from training.losses import NoisePredictionLoss, MechanicalPropertyLoss, GeneratedCurveMatchingLoss
-    from training.optimizers import get_optimizer, get_lr_scheduler
-    from data_processing.dataset import FEDataset # For type hinting
-    from data_processing.preprocessing import encode_protein_sequences # Needed if dataset returns raw sequences
-    # Import other necessary components/configs
-    # from config.model_config import ModelConfig # Example config loading
-    # from config.training_config import TrainingConfig
-except ImportError as e:
-    logging.error(f"Failed to import required modules: {e}")
-    logging.error("Please ensure src directory is in your PYTHONPATH or run from the project root.")
-    # Exit or raise error if imports fail
-    raise
+from .losses import NoisePredictionLoss, MechanicalPropertyLoss, GeneratedCurveMatchingLoss
+from .optimizers import get_optimizer, get_lr_scheduler
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-class Trainer:
+class BaseTrainer(ABC):
     """
-    Manages the training and evaluation loop for the ConditionalDiffusionModel.
+    Abstract Base Class for training generative models.
     """
     def __init__(self,
-                 model: ConditionalDiffusionModel,
+                 model: nn.Module, # Can be a single model or a dict of models (e.g., for GANs)
+                 train_dataloader: DataLoader,
+                 val_dataloader: DataLoader,
+                 optimizer_config: Union[Dict[str, Any], List[Dict[str, Any]]], # Single or list for GANs
+                 scheduler_config: Union[Dict[str, Any], List[Dict[str, Any]], None], # Single, list, or None
+                 loss_config: Dict[str, Any],
+                 epochs: int,
+                 device: Union[str, torch.device],
+                 log_dir: str = 'runs/',
+                 checkpoint_dir: str = 'checkpoints/',
+                 save_interval: int = 10,
+                 eval_interval: int = 1
+                ):
+        self.device = torch.device(device)
+        self.model = model # This might be a single nn.Module or a dict of them
+        if isinstance(self.model, nn.Module):
+            self.model = self.model.to(self.device)
+        elif isinstance(self.model, dict): # For GANs
+            for m_name, m_instance in self.model.items():
+                self.model[m_name] = m_instance.to(self.device)
+
+        self.train_dataloader = train_dataloader
+        self.val_dataloader = val_dataloader
+        self.epochs = epochs
+        self.start_epoch = 1 # For resuming training
+        self.log_dir = log_dir
+        self.checkpoint_dir = checkpoint_dir
+        self.save_interval = save_interval
+        self.eval_interval = eval_interval
+        self.loss_config = loss_config
+        self.best_val_loss = float('inf')
+
+
+        # --- Setup Optimizer(s) and LR Scheduler(s) ---
+        self._setup_optimizers_and_schedulers(optimizer_config, scheduler_config)
+
+        # --- Setup Logging and Checkpointing ---
+        os.makedirs(self.log_dir, exist_ok=True)
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
+        self.writer = SummaryWriter(log_dir=os.path.join(self.log_dir, self.__class__.__name__)) # Subdirectory for each trainer type
+
+        logging.info(f"{self.__class__.__name__} initialized.")
+
+    def _setup_optimizers_and_schedulers(self, optimizer_config, scheduler_config):
+        """Helper to set up single or multiple optimizers/schedulers."""
+        if isinstance(optimizer_config, list): # For GANs with multiple optimizers
+            self.optimizer = {}
+            self.scheduler = {} if scheduler_config else None
+            model_names = list(self.model.keys()) # Assuming model is a dict for GANs
+
+            if not isinstance(scheduler_config, list) and scheduler_config is not None:
+                logging.warning("Optimizer config is a list, but scheduler config is not. Schedulers might not match optimizers.")
+
+            for i, opt_conf in enumerate(optimizer_config):
+                model_key = opt_conf.get('model_name', model_names[i]) # Assign optimizer to model
+                if model_key not in self.model:
+                    raise ValueError(f"Model name '{model_key}' in optimizer config not found in self.model.")
+
+                self.optimizer[model_key] = get_optimizer(
+                    self.model[model_key],
+                    optimizer_name=opt_conf['name'],
+                    learning_rate=opt_conf['lr'],
+                    weight_decay=opt_conf.get('weight_decay', 0.0)
+                )
+                if self.scheduler and scheduler_config and i < len(scheduler_config):
+                    sch_conf = scheduler_config[i]
+                    self.scheduler[model_key] = get_lr_scheduler(
+                        self.optimizer[model_key],
+                        scheduler_name=sch_conf['name'],
+                        **sch_conf.get('params', {})
+                    )
+                elif self.scheduler:
+                     self.scheduler[model_key] = None # No scheduler for this optimizer
+            logging.info("Multiple optimizers and schedulers configured.")
+
+        else: # Single optimizer
+            self.optimizer = get_optimizer(
+                self.model, # Assumes self.model is a single nn.Module
+                optimizer_name=optimizer_config['name'],
+                learning_rate=optimizer_config['lr'],
+                weight_decay=optimizer_config.get('weight_decay', 0.0)
+            )
+            if scheduler_config and scheduler_config['name'] != 'none':
+                self.scheduler = get_lr_scheduler(
+                    self.optimizer,
+                    scheduler_name=scheduler_config['name'],
+                    **scheduler_config.get('params', {})
+                )
+            else:
+                self.scheduler = None
+            logging.info("Single optimizer and scheduler configured.")
+
+    @abstractmethod
+    def _train_epoch(self, epoch: int) -> Dict[str, float]:
+        """
+        Runs a single training epoch. Must be implemented by subclasses.
+        Should return a dictionary of training losses.
+        """
+        pass
+
+    @abstractmethod
+    def _validate_epoch(self, epoch: int) -> Dict[str, float]:
+        """
+        Evaluates the model on the validation set. Must be implemented by subclasses.
+        Should return a dictionary of validation losses/metrics.
+        """
+        pass
+
+    def train(self):
+        """
+        Starts the main training loop.
+        """
+        logging.info(f"Starting training with {self.__class__.__name__}...")
+
+        for epoch in range(self.start_epoch, self.epochs + 1):
+            train_losses = self._train_epoch(epoch)
+            self._log_metrics(train_losses, epoch, 'Train')
+
+            # Step learning rate scheduler(s) if not ReduceLROnPlateau
+            self._step_schedulers(epoch, val_metric=None, is_plateau_type=False)
+
+
+            if epoch % self.eval_interval == 0 or epoch == self.epochs:
+                val_metrics = self._validate_epoch(epoch)
+                self._log_metrics(val_metrics, epoch, 'Validation')
+
+                # For ReduceLROnPlateau, step based on a validation metric
+                # Assuming the first metric returned by _validate_epoch is the one to monitor
+                main_val_metric_name = list(val_metrics.keys())[0] if val_metrics else None
+                main_val_metric_value = val_metrics.get(main_val_metric_name) if main_val_metric_name else None
+
+                self._step_schedulers(epoch, val_metric=main_val_metric_value, is_plateau_type=True)
+
+                # Save best model based on a primary validation loss/metric
+                if main_val_metric_value is not None and main_val_metric_value < self.best_val_loss:
+                    self.best_val_loss = main_val_metric_value
+                    logging.info(f"Epoch {epoch}: New best validation metric ({main_val_metric_name}: {self.best_val_loss:.4f}). Saving model.")
+                    self.save_checkpoint(epoch, is_best=True)
+
+
+            if epoch % self.save_interval == 0 or epoch == self.epochs:
+                self.save_checkpoint(epoch, is_best=False) # Regular save
+
+        logging.info(f"Training finished for {self.__class__.__name__}.")
+        self.writer.close()
+
+    def _log_metrics(self, metrics: Dict[str, float], epoch: int, stage: str):
+        """Logs metrics to console and TensorBoard."""
+        log_message = f"{stage} Epoch [{epoch}/{self.epochs}]"
+        for name, value in metrics.items():
+            log_message += f", {name}: {value:.4f}"
+            self.writer.add_scalar(f'{stage}_{self.__class__.__name__}/{name}', value, epoch)
+        logging.info(log_message)
+        if stage == 'Train' and self.scheduler: # Log LR for training
+            if isinstance(self.optimizer, dict): # GAN case
+                 for i, (opt_name, opt_instance) in enumerate(self.optimizer.items()):
+                      self.writer.add_scalar(f'LearningRate/{opt_name}', opt_instance.param_groups[0]['lr'], epoch)
+            else: # Single optimizer case
+                 self.writer.add_scalar('LearningRate/main', self.optimizer.param_groups[0]['lr'], epoch)
+
+
+    def _step_schedulers(self, epoch: int, val_metric: float = None, is_plateau_type: bool = False):
+        """Steps single or multiple schedulers."""
+        if not self.scheduler:
+            return
+
+        if isinstance(self.scheduler, dict): # GAN case
+            for sch_name, sch_instance in self.scheduler.items():
+                if sch_instance:
+                    if isinstance(sch_instance, ReduceLROnPlateau):
+                        if is_plateau_type and val_metric is not None:
+                             sch_instance.step(val_metric)
+                    elif not is_plateau_type:
+                        sch_instance.step()
+        else: # Single scheduler case
+            if isinstance(self.scheduler, ReduceLROnPlateau):
+                if is_plateau_type and val_metric is not None:
+                     self.scheduler.step(val_metric)
+            elif not is_plateau_type:
+                self.scheduler.step()
+
+
+    def save_checkpoint(self, epoch: int, is_best: bool = False):
+        """Saves the model and optimizer state."""
+        checkpoint_name = f'checkpoint_epoch_{epoch}.pt'
+        if is_best:
+            checkpoint_name = 'best_model.pt'
+        checkpoint_path = os.path.join(self.checkpoint_dir, self.__class__.__name__, checkpoint_name)
+        os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
+
+
+        state = {'epoch': epoch, 'best_val_loss': self.best_val_loss}
+
+        if isinstance(self.model, nn.Module):
+            state['model_state_dict'] = self.model.state_dict()
+            state['optimizer_state_dict'] = self.optimizer.state_dict()
+            if self.scheduler:
+                state['scheduler_state_dict'] = self.scheduler.state_dict()
+        elif isinstance(self.model, dict): # GANs
+            state['model_state_dict'] = {name: m.state_dict() for name, m in self.model.items()}
+            state['optimizer_state_dict'] = {name: o.state_dict() for name, o in self.optimizer.items()}
+            if self.scheduler:
+                state['scheduler_state_dict'] = {name: s.state_dict() for name, s in self.scheduler.items() if s}
+        # Add model/training config for reproducibility
+        state['config'] = {
+            'loss_config': self.loss_config,
+            # Add relevant parts of model_cfg, train_cfg if needed
+        }
+
+        try:
+            torch.save(state, checkpoint_path)
+            logging.info(f"Checkpoint saved: {checkpoint_path}")
+        except Exception as e:
+            logging.error(f"Error saving checkpoint {checkpoint_path}: {e}")
+
+    def load_checkpoint(self, checkpoint_path: str):
+        """Loads the model and optimizer state from a checkpoint."""
+        if not os.path.exists(checkpoint_path):
+            logging.error(f"Checkpoint file not found: {checkpoint_path}")
+            raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
+
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location=self.device)
+
+            if isinstance(self.model, nn.Module):
+                self.model.load_state_dict(checkpoint['model_state_dict'])
+                self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                if self.scheduler and 'scheduler_state_dict' in checkpoint and checkpoint['scheduler_state_dict']:
+                    self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            elif isinstance(self.model, dict): # GANs
+                for name, model_state in checkpoint['model_state_dict'].items():
+                    self.model[name].load_state_dict(model_state)
+                for name, opt_state in checkpoint['optimizer_state_dict'].items():
+                    self.optimizer[name].load_state_dict(opt_state)
+                if self.scheduler and 'scheduler_state_dict' in checkpoint:
+                    for name, sch_state in checkpoint['scheduler_state_dict'].items():
+                        if self.scheduler.get(name) and sch_state:
+                             self.scheduler[name].load_state_dict(sch_state)
+
+
+            self.start_epoch = checkpoint['epoch'] + 1
+            self.best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+
+            logging.info(f"Checkpoint loaded from {checkpoint_path}. Resuming from epoch {self.start_epoch}.")
+            return self.start_epoch
+        except Exception as e:
+            logging.error(f"Error loading checkpoint {checkpoint_path}: {e}")
+            raise
+
+class DiffusionModelTrainer(BaseTrainer):
+    """
+    Trainer for ConditionalDiffusionModel.
+    """
+    def __init__(self,
+                 model: nn.Module, # Specific model type
                  train_dataloader: DataLoader,
                  val_dataloader: DataLoader,
                  optimizer_config: Dict[str, Any],
@@ -44,635 +283,433 @@ class Trainer:
                  device: Union[str, torch.device],
                  log_dir: str = 'runs/',
                  checkpoint_dir: str = 'checkpoints/',
-                 save_interval: int = 10, # Save checkpoint every N epochs
-                 eval_interval: int = 5 # Evaluate on validation set every N epochs
-                ):
-        """
-        Initializes the Trainer.
+                 save_interval: int = 10,
+                 eval_interval: int = 1):
+        super().__init__(model, train_dataloader, val_dataloader, optimizer_config, scheduler_config,
+                         loss_config, epochs, device, log_dir, checkpoint_dir, save_interval, eval_interval)
 
-        Args:
-            model (ConditionalDiffusionModel): The Diffusion Model to train.
-            train_dataloader (DataLoader): DataLoader for the training dataset.
-            val_dataloader (DataLoader): DataLoader for the validation dataset.
-            optimizer_config (Dict[str, Any]): Dictionary containing optimizer configuration
-                                                (e.g., {'name': 'adam', 'lr': 1e-4, 'weight_decay': 1e-5}).
-            scheduler_config (Dict[str, Any]): Dictionary containing LR scheduler configuration
-                                                (e.g., {'name': 'step', 'step_size': 30, 'gamma': 0.1} or {'name': 'none'}).
-            loss_config (Dict[str, Any]): Dictionary containing loss function configuration
-                                          (e.g., {'noise_weight': 1.0, 'mech_prop_weight': 0.1, 'curve_match_weight': 0.1, 'mech_prop_weights': {'max_force': 0.5}}).
-            epochs (int): Total number of epochs to train for.
-            device (Union[str, torch.device]): The device to train on ('cuda' or 'cpu').
-            log_dir (str): Directory for TensorBoard logs.
-            checkpoint_dir (str): Directory to save model checkpoints.
-            save_interval (int): Save checkpoint every this many epochs.
-            eval_interval (int): Evaluate on validation set every this many epochs.
-        """
-        self.device = torch.device(device)
-        self.model = model.to(self.device)
-        self.train_dataloader = train_dataloader
-        self.val_dataloader = val_dataloader
-        self.epochs = epochs
-        self.log_dir = log_dir
-        self.checkpoint_dir = checkpoint_dir
-        self.save_interval = save_interval
-        self.eval_interval = eval_interval
-
-        # --- Setup Optimizer ---
-        self.optimizer = get_optimizer(
-            self.model,
-            optimizer_name=optimizer_config['name'],
-            learning_rate=optimizer_config['lr'],
-            weight_decay=optimizer_config.get('weight_decay', 0.0) # Use .get for optional args
-        )
-
-        # --- Setup LR Scheduler ---
-        self.scheduler = get_lr_scheduler(
-            self.optimizer,
-            scheduler_name=scheduler_config['name'],
-            **scheduler_config.get('params', {}) # Pass scheduler-specific params
-        )
-
-        # --- Setup Loss Functions ---
+        # --- Setup Diffusion-Specific Loss Functions ---
         self.noise_loss_fn = NoisePredictionLoss()
         self.mech_prop_loss_fn = None
         self.curve_match_loss_fn = None
 
-        self.noise_loss_weight = loss_config.get('noise_weight', 1.0)
-        self.mech_prop_loss_weight = loss_config.get('mech_prop_weight', 0.0)
-        self.curve_match_loss_weight = loss_config.get('curve_match_weight', 0.0)
+        self.noise_loss_weight = self.loss_config.get('noise_weight', 1.0)
+        self.mech_prop_loss_weight = self.loss_config.get('mech_prop_weight', 0.0)
+        self.curve_match_loss_weight = self.loss_config.get('curve_match_weight', 0.0)
 
         if self.mech_prop_loss_weight > 0:
-            self.mech_prop_loss_fn = MechanicalPropertyLoss(loss_config.get('mech_prop_weights'))
-            logging.warning("Mechanical property loss is enabled. Ensure your property extraction is differentiable.")
+            self.mech_prop_loss_fn = MechanicalPropertyLoss(self.loss_config.get('mech_prop_weights'))
+            logging.info("Mechanical property loss enabled for DiffusionModelTrainer.")
 
         if self.curve_match_loss_weight > 0:
-             self.curve_match_loss_fn = GeneratedCurveMatchingLoss(loss_config.get('curve_match_type', 'mse'))
-             logging.warning("Generated curve matching loss is enabled. This loss is typically applied to predicted x_0.")
+            self.curve_match_loss_fn = GeneratedCurveMatchingLoss(self.loss_config.get('curve_match_type', 'mse'))
+            logging.info("Generated curve matching loss enabled for DiffusionModelTrainer.")
 
 
-        # --- Setup Logging and Checkpointing ---
-        os.makedirs(self.log_dir, exist_ok=True)
-        os.makedirs(self.checkpoint_dir, exist_ok=True)
-        self.writer = SummaryWriter(log_dir=self.log_dir)
-
-        logging.info("Trainer initialized.")
-
-
-    def _train_epoch(self, epoch: int):
-        """
-        Runs a single training epoch.
-        """
-        self.model.train() # Set model to training mode
-        running_loss = 0.0
-        noise_loss_sum = 0.0
-        mech_prop_loss_sum = 0.0
-        curve_match_loss_sum = 0.0
+    def _train_epoch(self, epoch: int) -> Dict[str, float]:
+        self.model.train()
+        running_losses = {'total_loss': 0.0, 'noise_loss': 0.0, 'mech_prop_loss': 0.0, 'curve_match_loss': 0.0}
+        num_batches = len(self.train_dataloader)
 
         start_time = time.time()
-
         for batch_idx, batch in enumerate(self.train_dataloader):
-            # Move batch data to the device
             x_0 = batch['fe_curve'].to(self.device)
-            # Sequence data handling depends on encoding type
             sequence_data = batch['sequence_data']
             if isinstance(sequence_data, torch.Tensor):
-                 sequence_data = sequence_data.to(self.device)
-            # If raw strings, it remains a list, and the ProteinEncoder handles it
-
+                sequence_data = sequence_data.to(self.device)
             conditions = batch['conditions'].to(self.device)
 
-            # Zero the gradients
             self.optimizer.zero_grad()
 
-            # Forward pass
-            # The model forward returns x_t, t, predicted_noise, true_noise
+            # Model forward returns: x_t, t, predicted_noise, true_noise
             x_t, t, predicted_noise, true_noise = self.model(x_0, sequence_data, conditions)
 
-            # Calculate total loss
-            total_loss = 0.0
-
-            # 1. Noise Prediction Loss (Primary Loss)
+            current_total_loss = 0.0
+            # 1. Noise Prediction Loss
             noise_loss = self.noise_loss_fn(predicted_noise, true_noise)
-            total_loss += self.noise_loss_weight * noise_loss
-            noise_loss_sum += noise_loss.item()
+            current_total_loss += self.noise_loss_weight * noise_loss
+            running_losses['noise_loss'] += noise_loss.item()
 
             # 2. Optional Mechanical Property Loss
-            if self.mech_prop_loss_fn is not None and self.mech_prop_loss_weight > 0:
-                 # To calculate mechanical property loss during training on a noisy step (x_t)
-                 # you might need to predict x_0 from predicted_noise:
-                 # x_0_hat = (x_t - self.model.sqrt_one_minus_alphas_bar[t.cpu()].view(-1, 1, 1).to(self.device) * predicted_noise) / self.model.sqrt_alphas_bar[t.cpu()].view(-1, 1, 1).to(self.device)
-                 # Or calculate properties directly on the potentially noisy x_t if meaningful.
-                 # For simplicity in this placeholder, let's assume we calculate it on a *derived* x_0_hat
-                 # This requires a detached x_0_hat if you only want the loss to influence the prediction of noise,
-                 # or non-detached if you want it to influence the network differently.
-                 # A common approach is to apply this loss only to the *final generated samples* during evaluation.
-                 # If applying during training, ensure differentiability.
-
-                 # Placeholder: Calculate loss comparing predicted_noise to true_noise
-                 # This is NOT the correct way to apply Mech Prop Loss during training typically
-                 # Replace this with calculation based on predicted x_0 or similar if desired
-                 mech_prop_loss = torch.tensor(0.0, device=self.device) # Replace with actual calculation
-                 # For a more correct approach, you'd calculate a quantity related to x_0 from x_t and predicted_noise
-                 # e.g., predicted_x0 = self.model._predict_x0_from_noise(x_t, t, predicted_noise) # Needs a helper in the model
-                 # mech_prop_loss = self.mech_prop_loss_fn(predicted_x0, x_0)
-
-                 total_loss += self.mech_prop_loss_weight * mech_prop_loss
-                 mech_prop_loss_sum += mech_prop_loss.item()
-                 logging.debug(f"Epoch {epoch}, Batch {batch_idx}: Mechanical property loss placeholder used.")
+            if self.mech_prop_loss_fn and self.mech_prop_loss_weight > 0:
+                # This requires predicting x_0 from (x_t, predicted_noise, t)
+                # which might need a helper method in the ConditionalDiffusionModel
+                # For now, this part is illustrative.
+                try:
+                    # Example: self.model._predict_x0_from_noise(x_t, t, predicted_noise)
+                    # For simplicity, let's assume a placeholder or skip if not implemented
+                    predicted_x0_for_loss = self.model._predict_x0_from_noise(x_t.detach(), t.detach(), predicted_noise) # Detach if needed
+                    mech_loss = self.mech_prop_loss_fn(predicted_x0_for_loss, x_0)
+                    current_total_loss += self.mech_prop_loss_weight * mech_loss
+                    running_losses['mech_prop_loss'] += mech_loss.item()
+                except AttributeError: # if _predict_x0_from_noise not in model
+                     logging.debug(f"Epoch {epoch}, Batch {batch_idx}: Skipping mech prop loss as _predict_x0_from_noise not found in model.")
+                except Exception as e:
+                    logging.warning(f"Epoch {epoch}, Batch {batch_idx}: Error in mech prop loss calculation: {e}")
 
 
             # 3. Optional Generated Curve Matching Loss
-            if self.curve_match_loss_fn is not None and self.curve_match_loss_weight > 0:
-                 # Similar to mech prop loss, this requires predicting x_0_hat
-                 curve_match_loss = torch.tensor(0.0, device=self.device) # Replace with actual calculation
-                 # e.g., predicted_x0 = self.model._predict_x0_from_noise(x_t, t, predicted_noise) # Needs a helper in the model
-                 # curve_match_loss = self.curve_match_loss_fn(predicted_x0, x_0)
+            if self.curve_match_loss_fn and self.curve_match_loss_weight > 0:
+                try:
+                    predicted_x0_for_loss = self.model._predict_x0_from_noise(x_t.detach(), t.detach(), predicted_noise) # Detach if needed
+                    curve_match_loss = self.curve_match_loss_fn(predicted_x0_for_loss, x_0)
+                    current_total_loss += self.curve_match_loss_weight * curve_match_loss
+                    running_losses['curve_match_loss'] += curve_match_loss.item()
+                except AttributeError:
+                     logging.debug(f"Epoch {epoch}, Batch {batch_idx}: Skipping curve match loss as _predict_x0_from_noise not found in model.")
+                except Exception as e:
+                    logging.warning(f"Epoch {epoch}, Batch {batch_idx}: Error in curve match loss calculation: {e}")
 
-                 total_loss += self.curve_match_loss_weight * curve_match_loss
-                 curve_match_loss_sum += curve_match_loss.item()
-                 logging.debug(f"Epoch {epoch}, Batch {batch_idx}: Curve matching loss placeholder used.")
 
-
-            # Backward pass and optimization
-            total_loss.backward()
+            current_total_loss.backward()
             self.optimizer.step()
+            running_losses['total_loss'] += current_total_loss.item()
 
-            running_loss += total_loss.item()
+        epoch_losses = {name: (loss_sum / num_batches if num_batches > 0 else 0) for name, loss_sum in running_losses.items()}
+        epoch_losses['time_seconds'] = time.time() - start_time
+        return epoch_losses
 
-            # Log batch loss to TensorBoard (optional, can be noisy)
-            # self.writer.add_scalar('Loss/train_batch', total_loss.item(), epoch * len(self.train_dataloader) + batch_idx)
-
-        end_time = time.time()
-        epoch_loss = running_loss / len(self.train_dataloader)
-        epoch_noise_loss = noise_loss_sum / len(self.train_dataloader)
-        epoch_mech_prop_loss = mech_prop_loss_sum / len(self.train_dataloader)
-        epoch_curve_match_loss = curve_match_loss_sum / len(self.train_dataloader)
-
-
-        logging.info(f"Epoch [{epoch}/{self.epochs}], Loss: {epoch_loss:.4f}, Time: {end_time - start_time:.2f}s")
-        logging.info(f"  Noise Loss: {epoch_noise_loss:.4f}")
-        if self.mech_prop_loss_fn is not None:
-            logging.info(f"  Mech Prop Loss (Placeholder): {epoch_mech_prop_loss:.4f}")
-        if self.curve_match_loss_fn is not None:
-             logging.info(f"  Curve Match Loss (Placeholder): {epoch_curve_match_loss:.4f}")
-
-
-        # Log epoch losses to TensorBoard
-        self.writer.add_scalar('Loss/train_epoch', epoch_loss, epoch)
-        self.writer.add_scalar('Loss/train_noise', epoch_noise_loss, epoch)
-        if self.mech_prop_loss_fn is not None:
-             self.writer.add_scalar('Loss/train_mech_prop', epoch_mech_prop_loss, epoch)
-        if self.curve_match_loss_fn is not None:
-             self.writer.add_scalar('Loss/train_curve_match', epoch_curve_match_loss, epoch)
-
-        # Step the learning rate scheduler if it's not ReduceLROnPlateau
-        if self.scheduler is not None and not isinstance(self.scheduler, ReduceLROnPlateau):
-            self.scheduler.step()
-            self.writer.add_scalar('LearningRate', self.optimizer.param_groups[0]['lr'], epoch)
-
-
-    def _validate(self, epoch: int) -> float:
-        """
-        Evaluates the model on the validation set.
-
-        Returns:
-            float: The average validation loss.
-        """
-        self.model.eval() # Set model to evaluation mode
-        running_loss = 0.0
-        noise_loss_sum = 0.0
-        mech_prop_loss_sum = 0.0
-        curve_match_loss_sum = 0.0
-
+    def _validate_epoch(self, epoch: int) -> Dict[str, float]:
+        self.model.eval()
+        running_losses = {'total_loss': 0.0, 'noise_loss': 0.0, 'mech_prop_loss': 0.0, 'curve_match_loss': 0.0}
+        num_batches = len(self.val_dataloader)
         start_time = time.time()
 
-        with torch.no_grad(): # Disable gradient calculation
+        with torch.no_grad():
             for batch_idx, batch in enumerate(self.val_dataloader):
-                # Move batch data to the device
                 x_0 = batch['fe_curve'].to(self.device)
                 sequence_data = batch['sequence_data']
                 if isinstance(sequence_data, torch.Tensor):
-                     sequence_data = sequence_data.to(self.device)
+                    sequence_data = sequence_data.to(self.device)
                 conditions = batch['conditions'].to(self.device)
 
-                # Forward pass (sample a random timestep for validation loss)
                 x_t, t, predicted_noise, true_noise = self.model(x_0, sequence_data, conditions)
 
-                # Calculate validation loss
-                total_loss = 0.0
+                current_total_loss = 0.0
                 noise_loss = self.noise_loss_fn(predicted_noise, true_noise)
-                total_loss += self.noise_loss_weight * noise_loss
-                noise_loss_sum += noise_loss.item()
-
-                # Optional Mechanical Property Loss (apply to derived x_0_hat)
-                if self.mech_prop_loss_fn is not None and self.mech_prop_loss_weight > 0:
-                     # Predict x_0_hat for evaluation metrics/losses if needed
-                     # predicted_x0 = self.model._predict_x0_from_noise(x_t, t, predicted_noise) # Needs a helper in the model
-                     # mech_prop_loss = self.mech_prop_loss_fn(predicted_x0, x_0) # Compare predicted x_0 to true x_0
-
-                     mech_prop_loss = torch.tensor(0.0, device=self.device) # Placeholder
-
-                     total_loss += self.mech_prop_loss_weight * mech_prop_loss
-                     mech_prop_loss_sum += mech_prop_loss.item()
-                     logging.debug(f"Epoch {epoch}, Validation Batch {batch_idx}: Mechanical property loss placeholder used.")
-
-
-                # Optional Generated Curve Matching Loss (apply to derived x_0_hat)
-                if self.curve_match_loss_fn is not None and self.curve_match_loss_weight > 0:
-                     # predicted_x0 = self.model._predict_x0_from_noise(x_t, t, predicted_noise) # Needs a helper in the model
-                     # curve_match_loss = self.curve_match_loss_fn(predicted_x0, x_0)
-
-                     curve_match_loss = torch.tensor(0.0, device=self.device) # Placeholder
-
-                     total_loss += self.curve_match_loss_weight * curve_match_loss
-                     curve_match_loss_sum += curve_match_loss.item()
-                     logging.debug(f"Epoch {epoch}, Validation Batch {batch_idx}: Curve matching loss placeholder used.")
-
-
-                running_loss += total_loss.item()
-
-
-        end_time = time.time()
-        val_loss = running_loss / len(self.val_dataloader)
-        val_noise_loss = noise_loss_sum / len(self.val_dataloader)
-        val_mech_prop_loss = mech_prop_loss_sum / len(self.val_dataloader)
-        val_curve_match_loss = curve_match_loss_sum / len(self.val_dataloader)
-
-
-        logging.info(f"Validation Epoch [{epoch}/{self.epochs}], Loss: {val_loss:.4f}, Time: {end_time - start_time:.2f}s")
-        logging.info(f"  Validation Noise Loss: {val_noise_loss:.4f}")
-        if self.mech_prop_loss_fn is not None:
-            logging.info(f"  Validation Mech Prop Loss (Placeholder): {val_mech_prop_loss:.4f}")
-        if self.curve_match_loss_fn is not None:
-             logging.info(f"  Validation Curve Match Loss (Placeholder): {val_curve_match_loss:.4f}")
-
-
-        # Log validation losses to TensorBoard
-        self.writer.add_scalar('Loss/val_epoch', val_loss, epoch)
-        self.writer.add_scalar('Loss/val_noise', val_noise_loss, epoch)
-        if self.mech_prop_loss_fn is not None:
-             self.writer.add_scalar('Loss/val_mech_prop', val_mech_prop_loss, epoch)
-        if self.curve_match_loss_fn is not None:
-             self.writer.add_scalar('Loss/val_curve_match', val_curve_match_loss, epoch)
-
-
-        # Step the learning rate scheduler if it's ReduceLROnPlateau
-        if self.scheduler is not None and isinstance(self.scheduler, ReduceLROnPlateau):
-            # ReduceLROnPlateau typically steps based on a validation metric
-            # Here we use the total validation loss
-            self.scheduler.step(val_loss)
-            self.writer.add_scalar('LearningRate', self.optimizer.param_groups[0]['lr'], epoch)
-
-
-        return val_loss
-
-    def train(self):
-        """
-        Starts the main training loop.
-        """
-        logging.info("Starting training...")
-        best_val_loss = float('inf')
-
-        for epoch in range(1, self.epochs + 1):
-            self._train_epoch(epoch)
-
-            # Evaluate on validation set
-            if epoch % self.eval_interval == 0 or epoch == self.epochs:
-                val_loss = self._validate(epoch)
-
-                # Save best model based on validation loss (optional)
-                # if val_loss < best_val_loss:
-                #     best_val_loss = val_loss
-                #     logging.info(f"Epoch {epoch}: New best validation loss achieved. Saving model.")
-                #     self.save_checkpoint(epoch, is_best=True)
-
-
-            # Save checkpoint periodically
-            if epoch % self.save_interval == 0 or epoch == self.epochs:
-                 self.save_checkpoint(epoch, is_best=False)
-
-
-        logging.info("Training finished.")
-        self.writer.close()
-
-
-    def save_checkpoint(self, epoch: int, is_best: bool = False):
-        """
-        Saves the model and optimizer state.
-
-        Args:
-            epoch (int): The current epoch number.
-            is_best (bool): Whether this is the best model so far.
-        """
-        checkpoint_name = f'checkpoint_epoch_{epoch}.pt'
-        if is_best:
-            checkpoint_name = 'best_model.pt'
-
-        checkpoint_path = os.path.join(self.checkpoint_dir, checkpoint_name)
-
-        state = {
-            'epoch': epoch,
-            'model_state_dict': self.model.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            # 'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler is not None else None,
-            'best_val_loss': getattr(self, 'best_val_loss', None), # Save if tracking best loss
-            'config': { # Save relevant configurations
-                'optimizer': self.optimizer.state_dict()['param_groups'][0], # Save initial params
-                'scheduler': self.scheduler.state_dict() if self.scheduler is not None else None,
-                # Add model config, loss config etc.
-            }
-        }
-
-        try:
-            torch.save(state, checkpoint_path)
-            logging.info(f"Checkpoint saved: {checkpoint_path}")
-        except Exception as e:
-            logging.error(f"Error saving checkpoint {checkpoint_path}: {e}")
-
-
-    def load_checkpoint(self, checkpoint_path: str):
-        """
-        Loads the model and optimizer state from a checkpoint.
-
-        Args:
-            checkpoint_path (str): Path to the checkpoint file.
-        """
-        if not os.path.exists(checkpoint_path):
-            logging.error(f"Checkpoint file not found: {checkpoint_path}")
-            raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
-
-        try:
-            checkpoint = torch.load(checkpoint_path, map_location=self.device)
-
-            self.model.load_state_dict(checkpoint['model_state_dict'])
-            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            # if 'scheduler_state_dict' in checkpoint and checkpoint['scheduler_state_dict'] is not None and self.scheduler is not None:
-            #      self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-
-            start_epoch = checkpoint['epoch'] + 1
-            # Update best_val_loss if tracking
-            if 'best_val_loss' in checkpoint and hasattr(self, 'best_val_loss'):
-                 self.best_val_loss = checkpoint['best_val_loss']
-
-            logging.info(f"Checkpoint loaded from {checkpoint_path}. Starting from epoch {start_epoch}.")
-            return start_epoch
-
-        except Exception as e:
-            logging.error(f"Error loading checkpoint {checkpoint_path}: {e}")
-            raise
-
-
-# Example Usage (requires dummy dataset and model)
-if __name__ == "__main__":
-    print("--- Testing trainer.py ---")
-
-    # Create dummy dataset, dataloaders, and model for testing
-    # These would normally come from your data_processing and models modules
-    class DummyDataset:
-        def __init__(self, num_samples=100, fe_len=200, seq_dim=100, cond_dim=2):
-            self.num_samples = num_samples
-            self.fe_len = fe_len
-            self.seq_dim = seq_dim
-            self.cond_dim = cond_dim
-
-        def __len__(self):
-            return self.num_samples
-
-        def __getitem__(self, idx):
-            # Simulate returning pre-encoded data
-            return {
-                'fe_curve': torch.randn(self.fe_len, 1), # FE curve (force)
-                'sequence_data': torch.randn(self.seq_dim), # Pre-encoded sequence
-                'conditions': torch.randn(self.cond_dim) # Conditions
-            }
-
-    class DummyProteinEncoder(nn.Module):
-         def __init__(self, input_dim, output_dim, encoding_type='pretrained_embeddings', **kwargs):
-            super().__init__()
-            self.output_dim = output_dim
-            self.fc = nn.Linear(input_dim, output_dim)
-            self.encoding_type = encoding_type # For forward pass logic
-         def forward(self, x):
-            # Simulate handling tensor input
-            return self.fc(x)
-
-    class DummyConditionEncoder(nn.Module):
-        def __init__(self, input_dim, output_dim):
-            super().__init__()
-            self.fc = nn.Linear(input_dim, output_dim)
-        def forward(self, x): return self.fc(x)
-
-    class DummyTimeEmbedding(nn.Module):
-        def __init__(self, embed_dim):
-            super().__init__()
-            self.fc = nn.Linear(embed_dim, embed_dim) # Simple linear for placeholder
-        def forward(self, t):
-            # Simulate time embedding output
-            return self.fc(torch.randn(t.size(0), self.fc.in_features))
-
-    class DummyDenoisingModel(nn.Module):
-         def __init__(self, fe_curve_length, fe_curve_channels, protein_embed_dim, condition_embed_dim, time_embed_dim, model_channels):
-             super().__init__()
-             # Simulate output matching fe_curve shape
-             self.output_proj = nn.Linear(model_channels, fe_curve_channels)
-             self.dummy_linear = nn.Linear(fe_curve_length * model_channels + protein_embed_dim + condition_embed_dim + time_embed_dim, fe_curve_length * model_channels) # Very rough placeholder to use inputs
-
-             # Need to account for how conditional embeddings are used... simpler dummy:
-             self.dummy_linear_alt = nn.Linear(fe_curve_length + protein_embed_dim + condition_embed_dim + time_embed_dim, fe_curve_length) # Sum dimensions for placeholder
-
-             # Correcting to match how ConditionalDenoisingModel forward is called:
-             # It expects x_t, time_emb, protein_emb, condition_emb
-             # x_t shape: (B, L, C_fe), others are (B, E)
-             # Output shape: (B, L, C_fe)
-             # Let's make a dummy that takes concatenated flattened inputs and reshapes output
-             total_flat_input_dim = fe_curve_length * fe_curve_channels + protein_embed_dim + condition_embed_dim + time_embed_dim
-             self.fc1 = nn.Linear(total_flat_input_dim, fe_curve_length * fe_curve_channels * 2) # Expand
-             self.fc2 = nn.Linear(fe_curve_length * fe_curve_channels * 2, fe_curve_length * fe_curve_channels) # Project back
-             self.fe_curve_length = fe_curve_length
-             self.fe_curve_channels = fe_curve_channels
-
-
-         def forward(self, x_t, time_emb, protein_embedding, condition_embedding):
-             # Flatten inputs and concatenate for dummy linear layers
-             batch_size = x_t.size(0)
-             x_t_flat = x_t.view(batch_size, -1)
-             protein_flat = protein_embedding.view(batch_size, -1)
-             condition_flat = condition_embedding.view(batch_size, -1)
-             time_flat = time_emb.view(batch_size, -1)
-
-             combined_input = torch.cat([x_t_flat, protein_flat, condition_flat, time_flat], dim=-1)
-
-             h = self.fc1(combined_input)
-             output_flat = self.fc2(h)
-
-             # Reshape output to match expected shape
-             output = output_flat.view(batch_size, self.fe_curve_length, self.fe_curve_channels)
-             return output # Simulate predicting noise
-
-
-    class DummyDiffusionModel(nn.Module):
-         def __init__(self, fe_curve_length, fe_curve_channels, protein_input_dim, protein_embed_dim, protein_encoding_type, condition_input_dim, condition_embed_dim, time_embed_dim, model_channels, num_diffusion_steps, beta_schedule):
-             super().__init__()
-             self.fe_curve_length = fe_curve_length
-             self.fe_curve_channels = fe_curve_channels
-             self.num_diffusion_steps = num_diffusion_steps
-
-             # Simplified diffusion schedule for dummy test
-             self.betas = torch.linspace(1e-4, 0.02, num_diffusion_steps)
-             self.alphas = 1.0 - self.betas
-             self.alphas_bar = torch.cumprod(self.alphas, dim=0)
-             self.sqrt_alphas_bar = torch.sqrt(self.alphas_bar)
-             self.sqrt_one_minus_alphas_bar = torch.sqrt(1.0 - self.alphas_bar)
-
-             # Instantiate dummy encoders and denoising model
-             self.protein_encoder = DummyProteinEncoder(protein_input_dim, protein_embed_dim, protein_encoding_type)
-             self.condition_encoder = DummyConditionEncoder(condition_input_dim, condition_embed_dim)
-             self.time_embedding = DummyTimeEmbedding(time_embed_dim)
-             self.denoising_model = DummyDenoisingModel(
-                 fe_curve_length, fe_curve_channels, protein_embed_dim, condition_embed_dim, time_embed_dim, model_channels
-             )
-
-         def sample_timesteps(self, batch_size, device):
-            return torch.randint(0, self.num_diffusion_steps, (batch_size,), device=device)
-
-         def forward_diffusion(self, x_0, t, noise=None):
-             if noise is None: noise = torch.randn_like(x_0)
-             sqrt_alphas_bar_t = self.sqrt_alphas_bar[t].view(-1, 1, 1).to(x_0.device) # Ensure on correct device
-             sqrt_one_minus_alphas_bar_t = self.sqrt_one_minus_alphas_bar[t].view(-1, 1, 1).to(x_0.device) # Ensure on correct device
-             x_t = sqrt_alphas_bar_t * x_0 + sqrt_one_minus_alphas_bar_t * noise
-             return x_t, noise
-
-         def forward(self, x_0, sequence_data, conditions):
-             batch_size = x_0.size(0)
-             device = x_0.device
-             t = self.sample_timesteps(batch_size, device)
-             x_t, noise = self.forward_diffusion(x_0, t)
-
-             protein_emb = self.protein_encoder(sequence_data)
-             condition_emb = self.condition_encoder(conditions)
-             time_emb = self.time_embedding(t)
-
-             predicted_noise = self.denoosing_model(x_t, time_emb, protein_emb, condition_emb) # Typo fix: denoising_model
-             # Corrected call:
-             predicted_noise = self.denoising_model(x_t, time_emb, protein_emb, condition_emb)
-
-
-             return x_t, t, predicted_noise, noise
-
-         @torch.no_grad()
-         def generate(self, sequence_data, conditions, num_samples=1, device='cpu'):
-             # Simplified generation for dummy model
-             logging.warning("Using dummy generate method in DummyDiffusionModel.")
-             batch_size = len(sequence_data) if isinstance(sequence_data, list) else sequence_data.size(0)
-
-             # Simulate returning random data with correct shape
-             generated_curves = torch.randn(batch_size, self.fe_curve_length, self.fe_curve_channels, device=device)
-             return generated_curves
-
-
-    # Dummy parameters
-    fe_len = 200
-    seq_input_dim = 100
-    seq_embed_dim = 128
-    cond_input_dim = 2
-    cond_embed_dim = 64
-    time_embed_dim = 128
-    model_channels = 256
-    num_diff_steps = 100
-    num_epochs = 5
-    batch_sz = 16
-
-    # Create dummy data and dataloaders
-    dummy_train_dataset = DummyDataset(num_samples=1000, fe_len=fe_len, seq_dim=seq_input_dim, cond_dim=cond_input_dim)
-    dummy_val_dataset = DummyDataset(num_samples=200, fe_len=fe_len, seq_dim=seq_input_dim, cond_dim=cond_input_dim)
-    dummy_train_dataloader = DataLoader(dummy_train_dataset, batch_size=batch_sz, shuffle=True)
-    dummy_val_dataloader = DataLoader(dummy_val_dataset, batch_size=batch_sz, shuffle=False)
-
-    # Create dummy model
-    dummy_model = DummyDiffusionModel(
-        fe_curve_length=fe_len,
-        fe_curve_channels=1,
-        protein_input_dim=seq_input_dim,
-        protein_embed_dim=seq_embed_dim,
-        protein_encoding_type='pretrained_embeddings',
-        condition_input_dim=cond_input_dim,
-        condition_embed_dim=cond_embed_dim,
-        time_embed_dim=time_embed_dim,
-        model_channels=model_channels,
-        num_diffusion_steps=num_diff_steps,
-        beta_schedule='linear'
-    )
-
-    # Define dummy optimizer and loss configurations
-    optimizer_cfg = {'name': 'adamw', 'lr': 1e-4, 'weight_decay': 1e-5}
-    scheduler_cfg = {'name': 'step', 'params': {'step_size': 2, 'gamma': 0.5}} # Halve LR every 2 epochs
-    # scheduler_cfg = {'name': 'reduceonplateau', 'params': {'mode': 'min', 'factor': 0.5, 'patience': 3}}
-    # scheduler_cfg = {'name': 'none'}
-
-    loss_cfg = {
-        'noise_weight': 1.0,
-        # 'mech_prop_weight': 0.1, # Uncomment to test mech prop loss (placeholder)
-        # 'curve_match_weight': 0.1, # Uncomment to test curve match loss (placeholder)
-        # 'mech_prop_weights': {'unfolding_energy': 0.5, 'max_force': 0.5} # If mech_prop_weight > 0
-    }
-
-    # Determine device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"\nUsing device: {device}")
-
-    # Instantiate and run the Trainer
-    try:
-        trainer = Trainer(
-            model=dummy_model,
-            train_dataloader=dummy_train_dataloader,
-            val_dataloader=dummy_val_dataloader,
-            optimizer_config=optimizer_cfg,
-            scheduler_config=scheduler_cfg,
-            loss_config=loss_cfg,
-            epochs=num_epochs,
-            device=device,
-            log_dir='dummy_runs/',
-            checkpoint_dir='dummy_checkpoints/',
-            save_interval=2, # Save every 2 epochs
-            eval_interval=1 # Evaluate every epoch
-        )
-        print("Trainer instantiated successfully.")
-
-        # Clean up previous dummy runs/checkpoints
-        # import shutil
-        # if os.path.exists('dummy_runs'): shutil.rmtree('dummy_runs')
-        # if os.path.exists('dummy_checkpoints'): shutil.rmtree('dummy_checkpoints')
-
-
-        trainer.train()
-
-        # Example of loading a checkpoint
-        # print("\n--- Testing loading checkpoint ---")
-        # latest_checkpoint = os.path.join('dummy_checkpoints', f'checkpoint_epoch_{num_epochs}.pt')
-        # if os.path.exists(latest_checkpoint):
-        #      print(f"Attempting to load from {latest_checkpoint}")
-        #      # Need a new Trainer instance or reset state if loading into the same one
-        #      # For simplicity, let's just demonstrate the load_checkpoint call
-        #      try:
-        #          dummy_model_loaded = DummyDiffusionModel(
-        #             fe_curve_length=fe_len, fe_curve_channels=1, protein_input_dim=seq_input_dim, protein_embed_dim=seq_embed_dim, protein_encoding_type='pretrained_embeddings',
-        #             condition_input_dim=cond_input_dim, condition_embed_dim=cond_embed_dim, time_embed_dim=time_embed_dim, model_channels=model_channels, num_diffusion_steps=num_diff_steps, beta_schedule='linear'
-        #          ).to(device)
-        #          dummy_optimizer_loaded = get_optimizer(dummy_model_loaded, **optimizer_cfg)
-        #          dummy_trainer_loaded = Trainer(
-        #              model=dummy_model_loaded, train_dataloader=dummy_train_dataloader, val_dataloader=dummy_val_dataloader,
-        #              optimizer_config=optimizer_cfg, scheduler_config=scheduler_cfg, loss_config=loss_cfg, epochs=num_epochs,
-        #              device=device, log_dir='dummy_runs_load/', checkpoint_dir='dummy_checkpoints_load/'
-        #          )
-        #          start_epoch_loaded = dummy_trainer_loaded.load_checkpoint(latest_checkpoint)
-        #          print(f"Successfully loaded checkpoint. Next epoch would be {start_epoch_loaded}.")
-        #      except Exception as e:
-        #          print(f"Error during checkpoint loading test: {e}")
-        # else:
-        #      print(f"Checkpoint {latest_checkpoint} not found to test loading.")
-
-
-    except Exception as e:
-        print(f"An error occurred during Trainer test: {e}")
-        import traceback
-        traceback.print_exc()
+                current_total_loss += self.noise_loss_weight * noise_loss
+                running_losses['noise_loss'] += noise_loss.item()
+
+                if self.mech_prop_loss_fn and self.mech_prop_loss_weight > 0:
+                    try:
+                        predicted_x0_for_loss = self.model._predict_x0_from_noise(x_t, t, predicted_noise)
+                        mech_loss = self.mech_prop_loss_fn(predicted_x0_for_loss, x_0)
+                        current_total_loss += self.mech_prop_loss_weight * mech_loss
+                        running_losses['mech_prop_loss'] += mech_loss.item()
+                    except AttributeError: pass
+                    except Exception: pass
+
+
+                if self.curve_match_loss_fn and self.curve_match_loss_weight > 0:
+                    try:
+                        predicted_x0_for_loss = self.model._predict_x0_from_noise(x_t, t, predicted_noise)
+                        curve_match_loss = self.curve_match_loss_fn(predicted_x0_for_loss, x_0)
+                        current_total_loss += self.curve_match_loss_weight * curve_match_loss
+                        running_losses['curve_match_loss'] += curve_match_loss.item()
+                    except AttributeError: pass
+                    except Exception: pass
+
+                running_losses['total_loss'] += current_total_loss.item()
+
+        epoch_losses = {name: (loss_sum / num_batches if num_batches > 0 else 0) for name, loss_sum in running_losses.items()}
+        epoch_losses['time_seconds'] = time.time() - start_time
+        return epoch_losses
+
+class VAETrainer(BaseTrainer):
+    """
+    Trainer for Variational Autoencoder (VAE) models.
+    """
+    def __init__(self,
+                 model: nn.Module, # Should be your VAEModel
+                 train_dataloader: DataLoader,
+                 val_dataloader: DataLoader,
+                 optimizer_config: Dict[str, Any],
+                 scheduler_config: Dict[str, Any],
+                 loss_config: Dict[str, Any], # e.g., {'reconstruction_weight': 1.0, 'kl_weight': 0.001}
+                 epochs: int,
+                 device: Union[str, torch.device],
+                 log_dir: str = 'runs/',
+                 checkpoint_dir: str = 'checkpoints/',
+                 save_interval: int = 10,
+                 eval_interval: int = 1):
+        super().__init__(model, train_dataloader, val_dataloader, optimizer_config, scheduler_config,
+                         loss_config, epochs, device, log_dir, checkpoint_dir, save_interval, eval_interval)
+
+        # --- VAE Specific Loss ---
+        # self.vae_loss_fn = VAELoss(reconstruction_weight=self.loss_config.get('reconstruction_weight', 1.0),
+        #                            kl_weight=self.loss_config.get('kl_weight', 1.0))
+        # For now, let's assume the VAE model's forward pass returns reconstruction_loss and kl_loss directly
+        logging.info("VAETrainer initialized. Ensure VAE model forward returns 'reconstruction_loss' and 'kl_loss'.")
+
+
+    def _train_epoch(self, epoch: int) -> Dict[str, float]:
+        self.model.train()
+        running_losses = {'total_loss': 0.0, 'reconstruction_loss': 0.0, 'kl_loss': 0.0}
+        num_batches = len(self.train_dataloader)
+        start_time = time.time()
+
+        for batch_idx, batch in enumerate(self.train_dataloader):
+            # VAEs typically take x_0 as input and try to reconstruct it
+            x_0 = batch['fe_curve']
+            # VAEs can also be conditional, so handle sequence_data and conditions
+            sequence_data = batch.get('sequence_data') # .get() for optional
+            conditions = batch.get('conditions')
+
+            self.optimizer.zero_grad()
+
+            # VAE model forward should return: reconstructed_x, mu, logvar
+            # Loss calculation is often done inside the model or a separate VAELoss class
+            # For simplicity, assume model.forward returns a dict of losses or individual losses
+            # Example: output_dict = self.model(x_0, sequence_data, conditions)
+            # recon_loss = output_dict['reconstruction_loss']
+            # kl_div = output_dict['kl_loss']
+
+            # --- Placeholder for VAE forward and loss ---
+            # This needs to be adapted to your specific VAE model implementation
+            # Assuming model forward returns (reconstructed_x, mu, logvar)
+            try:
+                reconstructed_x, mu, logvar = self.model(x_0, conditions) # Adapt to your VAE input
+                recon_loss = nn.functional.mse_loss(reconstructed_x, x_0, reduction='sum') / x_0.size(0) # Example MSE per sample
+                # KL divergence: 0.5 * sum(1 + log(sigma^2) - mu^2 - sigma^2)
+                kl_div = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) / x_0.size(0) # Per sample
+            except Exception as e:
+                 logging.error(f"Error in VAE forward/loss: {e}. Using dummy losses.")
+                 recon_loss = torch.tensor(0.0, device=self.device)
+                 kl_div = torch.tensor(0.0, device=self.device)
+            # --------------------------------------------
+
+
+            reconstruction_weight = self.loss_config.get('reconstruction_weight', 1.0)
+            kl_weight = self.loss_config.get('kl_weight', 1.0) # Beta-VAE factor
+
+            current_total_loss = reconstruction_weight * recon_loss + kl_weight * kl_div
+
+            current_total_loss.backward()
+            self.optimizer.step()
+
+            running_losses['total_loss'] += current_total_loss.item()
+            running_losses['reconstruction_loss'] += recon_loss.item()
+            running_losses['kl_loss'] += kl_div.item()
+
+        epoch_losses = {name: (loss_sum / num_batches if num_batches > 0 else 0) for name, loss_sum in running_losses.items()}
+        epoch_losses['time_seconds'] = time.time() - start_time
+        return epoch_losses
+
+
+    def _validate_epoch(self, epoch: int) -> Dict[str, float]:
+        self.model.eval()
+        running_losses = {'total_loss': 0.0, 'reconstruction_loss': 0.0, 'kl_loss': 0.0}
+        num_batches = len(self.val_dataloader)
+        start_time = time.time()
+
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(self.val_dataloader):
+                x_0 = batch['fe_curve'].to(self.device)
+                sequence_data = batch.get('sequence_data')
+                conditions = batch.get('conditions')
+                if sequence_data is not None and isinstance(sequence_data, torch.Tensor):
+                    sequence_data = sequence_data.to(self.device)
+                if conditions is not None and isinstance(conditions, torch.Tensor):
+                    conditions = conditions.to(self.device)
+
+                # --- Placeholder for VAE forward and loss ---
+                try:
+                    reconstructed_x, mu, logvar = self.model(x_0, conditions)
+                    recon_loss = nn.functional.mse_loss(reconstructed_x, x_0, reduction='sum') / x_0.size(0)
+                    kl_div = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) / x_0.size(0)
+                except Exception:
+                    recon_loss = torch.tensor(0.0, device=self.device)
+                    kl_div = torch.tensor(0.0, device=self.device)
+                # --------------------------------------------
+
+                reconstruction_weight = self.loss_config.get('reconstruction_weight', 1.0)
+                kl_weight = self.loss_config.get('kl_weight', 1.0)
+                current_total_loss = reconstruction_weight * recon_loss + kl_weight * kl_div
+
+                running_losses['total_loss'] += current_total_loss.item()
+                running_losses['reconstruction_loss'] += recon_loss.item()
+                running_losses['kl_loss'] += kl_div.item()
+
+        epoch_losses = {name: (loss_sum / num_batches if num_batches > 0 else 0) for name, loss_sum in running_losses.items()}
+        epoch_losses['time_seconds'] = time.time() - start_time
+        return epoch_losses
+
+
+class GANTrainer(BaseTrainer):
+    """
+    Trainer for Generative Adversarial Network (GAN) models.
+    Assumes model is a dict: {'generator': GenModel, 'discriminator': DiscModel}
+    Assumes optimizer_config and scheduler_config are lists of two dicts,
+    one for generator and one for discriminator.
+    """
+    def __init__(self,
+                 models: Dict[str, nn.Module], # {'generator': Gen, 'discriminator': Disc}
+                 train_dataloader: DataLoader,
+                 val_dataloader: DataLoader, # Validation for GANs can be tricky (e.g., FID score)
+                 optimizer_configs: List[Dict[str, Any]], # [{'model_name':'generator', ...}, {'model_name':'discriminator', ...}]
+                 scheduler_configs: List[Dict[str, Any]],
+                 loss_config: Dict[str, Any], # e.g., weights for G/D losses, feature matching
+                 epochs: int,
+                 device: Union[str, torch.device],
+                 log_dir: str = 'runs/',
+                 checkpoint_dir: str = 'checkpoints/',
+                 save_interval: int = 10,
+                 eval_interval: int = 1,
+                 k_critic_steps: int = 1 # For WGAN: number of critic updates per generator update
+                ):
+        super().__init__(models, train_dataloader, val_dataloader, optimizer_configs, scheduler_configs,
+                         loss_config, epochs, device, log_dir, checkpoint_dir, save_interval, eval_interval)
+
+        self.generator = self.model['generator']
+        self.discriminator = self.model['discriminator']
+        self.optimizer_g = self.optimizer['generator']
+        self.optimizer_d = self.optimizer['discriminator']
+        self.scheduler_g = self.scheduler.get('generator') if self.scheduler else None
+        self.scheduler_d = self.scheduler.get('discriminator') if self.scheduler else None
+        self.k_critic_steps = k_critic_steps
+
+
+        # --- GAN Specific Losses ---
+        # self.criterion_g = GANGeneratorLoss(...)
+        # self.criterion_d = GANDiscriminatorLoss(...)
+        # For simplicity, assume binary cross entropy for now
+        self.adversarial_loss = nn.BCEWithLogitsLoss() # Or MSELoss for LSGAN
+        # Or use specific loss functions from your loss_config
+        logging.info("GANTrainer initialized. Ensure GAN loss functions are set up.")
+
+    def _train_epoch(self, epoch: int) -> Dict[str, float]:
+        self.generator.train()
+        self.discriminator.train()
+        running_losses = {'g_loss': 0.0, 'd_loss_real': 0.0, 'd_loss_fake':0.0, 'd_loss_total': 0.0}
+        num_batches = len(self.train_dataloader)
+        start_time = time.time()
+
+        for batch_idx, batch in enumerate(self.train_dataloader):
+            real_samples = batch['fe_curve'].to(self.device) # Assuming F-E curves are real samples
+            batch_size = real_samples.size(0)
+
+            # Latent vector for generator input
+            # Noise dimension should be part of generator's config
+            z_dim = self.generator.z_dim if hasattr(self.generator, 'z_dim') else 100 # Placeholder
+            z = torch.randn(batch_size, z_dim, device=self.device)
+
+            # Conditional GAN: Get conditions
+            sequence_data = batch.get('sequence_data')
+            conditions_input = batch.get('conditions')
+            if sequence_data is not None and isinstance(sequence_data, torch.Tensor):
+                sequence_data = sequence_data.to(self.device)
+            if conditions_input is not None and isinstance(conditions_input, torch.Tensor):
+                conditions_input = conditions_input.to(self.device)
+            # Concatenate or process sequence_data and conditions_input into a single conditional vector if needed by G and D
+
+            # --- Train Discriminator ---
+            for _ in range(self.k_critic_steps): # WGAN-like update schedule
+                self.optimizer_d.zero_grad()
+
+                # Real samples
+                d_real_output = self.discriminator(real_samples, sequence_data, conditions_input) # Adapt to your D input
+                d_loss_real = self.adversarial_loss(d_real_output, torch.ones_like(d_real_output))
+
+                # Fake samples
+                fake_samples = self.generator(z, sequence_data, conditions_input).detach() # Detach to avoid training G here
+                d_fake_output = self.discriminator(fake_samples, sequence_data, conditions_input)
+                d_loss_fake = self.adversarial_loss(d_fake_output, torch.zeros_like(d_fake_output))
+
+                # Total discriminator loss
+                d_loss_total = (d_loss_real + d_loss_fake) / 2
+                d_loss_total.backward()
+                self.optimizer_d.step()
+
+                # Optional: WGAN-GP gradient penalty (not implemented here)
+
+            running_losses['d_loss_real'] += d_loss_real.item()
+            running_losses['d_loss_fake'] += d_loss_fake.item()
+            running_losses['d_loss_total'] += d_loss_total.item()
+
+
+            # --- Train Generator ---
+            self.optimizer_g.zero_grad()
+            # Generate new fake samples (no detach this time)
+            fake_samples_for_g = self.generator(z, sequence_data, conditions_input)
+            g_fake_output = self.discriminator(fake_samples_for_g, sequence_data, conditions_input)
+            g_loss = self.adversarial_loss(g_fake_output, torch.ones_like(g_fake_output)) # Try to fool D
+
+            # Optional: Add other generator losses (e.g., feature matching, perceptual loss)
+            # g_loss += some_other_g_loss_weight * calculate_other_g_loss(...)
+
+            g_loss.backward()
+            self.optimizer_g.step()
+            running_losses['g_loss'] += g_loss.item()
+
+        epoch_losses = {name: (loss_sum / num_batches if num_batches > 0 else 0) for name, loss_sum in running_losses.items()}
+        epoch_losses['time_seconds'] = time.time() - start_time
+        return epoch_losses
+
+    def _validate_epoch(self, epoch: int) -> Dict[str, float]:
+        self.generator.eval()
+        self.discriminator.eval()
+        # Validation for GANs is often qualitative (visual inspection of samples)
+        # or uses metrics like Inception Score, FID (Frechet Inception Distance).
+        # These are complex to implement here and depend on the data modality.
+        # For SMFS curves, you might compare distributions of generated vs. real mechanical properties.
+
+        # Placeholder: Generate some samples and calculate a dummy metric
+        # Or simply log generator/discriminator loss on val set if meaningful
+        running_losses = {'val_g_loss': 0.0, 'val_d_loss': 0.0} # Example
+        num_batches = len(self.val_dataloader)
+        start_time = time.time()
+
+        if num_batches == 0:
+            return {'val_g_loss': 0.0, 'val_d_loss': 0.0, 'time_seconds': 0.0} # No validation data
+
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(self.val_dataloader):
+                real_samples = batch['fe_curve'].to(self.device)
+                batch_size = real_samples.size(0)
+                z_dim = self.generator.z_dim if hasattr(self.generator, 'z_dim') else 100
+                z = torch.randn(batch_size, z_dim, device=self.device)
+
+                sequence_data = batch.get('sequence_data')
+                conditions_input = batch.get('conditions')
+                if sequence_data is not None and isinstance(sequence_data, torch.Tensor): sequence_data = sequence_data.to(self.device)
+                if conditions_input is not None and isinstance(conditions_input, torch.Tensor): conditions_input = conditions_input.to(self.device)
+
+
+                # Discriminator validation loss
+                d_real_output = self.discriminator(real_samples, sequence_data, conditions_input)
+                d_loss_real_val = self.adversarial_loss(d_real_output, torch.ones_like(d_real_output))
+                fake_samples_val = self.generator(z, sequence_data, conditions_input)
+                d_fake_output_val = self.discriminator(fake_samples_val, sequence_data, conditions_input)
+                d_loss_fake_val = self.adversarial_loss(d_fake_output_val, torch.zeros_like(d_fake_output_val))
+                d_loss_total_val = (d_loss_real_val + d_loss_fake_val) / 2
+                running_losses['val_d_loss'] += d_loss_total_val.item()
+
+                # Generator validation loss
+                g_fake_output_val = self.discriminator(fake_samples_val, sequence_data, conditions_input) # Re-use fake samples
+                g_loss_val = self.adversarial_loss(g_fake_output_val, torch.ones_like(g_fake_output_val))
+                running_losses['val_g_loss'] += g_loss_val.item()
+
+        epoch_losses = {name: (loss_sum / num_batches if num_batches > 0 else 0) for name, loss_sum in running_losses.items()}
+        epoch_losses['time_seconds'] = time.time() - start_time
+
+        # Log some generated samples (if applicable)
+        # self.log_generated_samples(epoch, num_samples_to_log=5)
+        return epoch_losses
+
+    # def log_generated_samples(self, epoch, num_samples_to_log=5):
+    #     """Helper to log some generated samples during validation (e.g., to TensorBoard)."""
+    #     self.generator.eval()
+    #     with torch.no_grad():
+    #         z_dim = self.generator.z_dim if hasattr(self.generator, 'z_dim') else 100
+    #         fixed_z = torch.randn(num_samples_to_log, z_dim, device=self.device)
+    #         # Need fixed conditional inputs too if conditional GAN
+    #         # fixed_conditions = ...
+    #         generated_samples = self.generator(fixed_z, fixed_conditions)
+    #         # Assuming F-E curves can be plotted (e.g., using matplotlib and add_figure to TensorBoard)
+    #         # This part is highly specific to your data and visualization needs.
+    #         # For example, plot curves and add as images:
+    #         # fig, axes = plt.subplots(1, num_samples_to_log, figsize=(15, 3))
+    #         # for i in range(num_samples_to_log):
+    #         #     axes[i].plot(generated_samples[i].cpu().numpy().squeeze()) # Assuming 1D curve
+    #         # self.writer.add_figure(f'Generated_Samples_Epoch_{epoch}', fig, global_step=epoch)
+    #     self.generator.train()

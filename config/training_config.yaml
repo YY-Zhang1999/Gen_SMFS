@@ -4,7 +4,7 @@
 
 # --- General Training Parameters ---
 epochs: 100 # Total number of training epochs
-batch_size: 32 # Batch size for training
+batch_size: 16 # Batch size for training
 
 # Device to use for training ('cuda' or 'cpu')
 device: cuda # Or cpu

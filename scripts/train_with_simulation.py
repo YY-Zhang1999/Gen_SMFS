@@ -1,7 +1,8 @@
 # scripts/train.py
-
 import os
 from typing import Dict, Any
+import sys
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../src/models')))
 
 import yaml
 import argparse
@@ -9,21 +10,9 @@ import logging
 import torch
 from torch.utils.data import DataLoader
 
-# Ensure src is in PYTHONPATH
-import sys
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../src')))
-
-try:
-    from data_processing.dataset import FEDataset
-    from models.diffusion_model import ConditionalDiffusionModel
-    from training.trainer import Trainer
-    # Import specific collate functions if needed (e.g., for raw sequences)
-    # from data_processing.collate_fn import collate_fn_raw_seq
-
-except ImportError as e:
-    logging.error(f"Failed to import required modules: {e}")
-    logging.error("Please ensure the 'src' directory is in your PYTHONPATH.")
-    sys.exit(1)
+from Gen_SMFS.src.data_processing.dataset import FEDataset
+from Gen_SMFS.src.training.trainer import VAETrainer
+from Gen_SMFS.src.models.vae import create_conditiaonl_vae_model
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -78,8 +67,11 @@ def main(data_config_path: str, model_config_path: str, training_config_path: st
 
     # Assuming the processed files contain all data and FEDataset handles loading
     # You will likely need to modify FEDataset or add a split logic here.
+    device = torch.device(train_cfg.get('device', 'cpu'))
+
     full_dataset = FEDataset(
         fe_curves_path=fe_curves_path,
+        device=device,
         conditions_path=conditions_path,
         fe_curve_length=preprocessing_params['fe_curve_length']
     )
@@ -100,8 +92,9 @@ def main(data_config_path: str, model_config_path: str, training_config_path: st
         batch_size=train_cfg['batch_size'],
         shuffle=True,
         collate_fn=collate_fn,
-        num_workers=os.cpu_count() // 2 or 1 # Example num_workers
+        num_workers=0 # Example num_workers
     )
+
     val_dataloader = DataLoader(
         val_dataset,
         batch_size=train_cfg['batch_size'],
@@ -110,34 +103,25 @@ def main(data_config_path: str, model_config_path: str, training_config_path: st
         num_workers=os.cpu_count() // 2 or 1
     )
 
-    return
-
     # --- Model Initialization ---
     logging.info("Initializing model...")
-    model = ConditionalDiffusionModel(
-        fe_curve_length=model_cfg['fe_curve_length'],
-        fe_curve_channels=model_cfg['fe_curve_channels'],
-        protein_input_dim=model_cfg['protein_input_dim'], # Will be None for 'raw'
-        protein_embed_dim=model_cfg['protein_embed_dim'],
-        protein_encoding_type=model_cfg['protein_encoding_type'],
-        protein_plm_name=model_cfg.get('protein_plm_name'),
-        protein_plm_embed_dim=model_cfg.get('protein_plm_embed_dim'),
-        protein_freeze_plm=model_cfg.get('protein_freeze_plm', True),
-        condition_input_dim=model_cfg['condition_input_dim'],
-        condition_embed_dim=model_cfg['condition_embed_dim'],
-        time_embed_dim=model_cfg['time_embed_dim'],
-        model_channels=model_cfg['model_channels'],
-        num_diffusion_steps=model_cfg['num_diffusion_steps'],
-        beta_schedule=model_cfg.get('beta_schedule', 'linear')
-        # Pass other model config parameters as needed
+    model = create_conditiaonl_vae_model(
+        input_feature_dim=1,
+        sequence_len=preprocessing_params['fe_curve_length'],
+        latent_feature_dim=4,
+        conditional_dim=1,
+        scale_factor=4,
+        backbone_type='transformer',
+        use_crossattention=True,
     )
+
+
     logging.info("Model initialized.")
 
     # --- Trainer Setup ---
     logging.info("Setting up trainer...")
-    device = torch.device(train_cfg.get('device', 'cpu'))
 
-    trainer = Trainer(
+    trainer = VAETrainer(
         model=model,
         train_dataloader=train_dataloader,
         val_dataloader=val_dataloader,
@@ -172,13 +156,15 @@ def main(data_config_path: str, model_config_path: str, training_config_path: st
     # Modify the trainer's train method to accept a starting epoch if implementing resume
     # For simplicity in this example, we'll assume train always starts from 1 or loaded epoch
     # trainer.train(start_epoch=start_epoch) # You might modify Trainer.train()
-    trainer.train() # Current Trainer.train() starts from 1, load_checkpoint updates state
+    trainer.train()  # Current Trainer.train() starts from 1, load_checkpoint updates state
 
     logging.info("Training script finished.")
 
 
+
+
 if __name__ == "__main__":
-    main('C:\\Users\\Yiyuan Zhang\\PycharmProjects\\pythonProject\\Gen_SMFS\\config\\simulation_data_config.yaml',
-         'C:\\Users\\Yiyuan Zhang\\PycharmProjects\\pythonProject\\Gen_SMFS\\config\\model_config.yaml',
-         'C:\\Users\\Yiyuan Zhang\\PycharmProjects\\pythonProject\\Gen_SMFS\\config\\training_config.yaml',
-         'C:\\Users\\Yiyuan Zhang\\PycharmProjects\\pythonProject\\Gen_SMFS\\results')
+    main('..\\config\\simulation_data_config.yaml',
+         '..\\config\\model_config.yaml',
+         '..\\config\\training_config.yaml',
+         '..\\results')
