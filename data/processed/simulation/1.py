@@ -4,6 +4,9 @@ import numpy as np
 a = np.load('fe_curves.npy')
 
 for i in range(5):
-    plt.plot(a[i])
+
+    plt.plot(a[i][1:])
+
+
 
 plt.show()

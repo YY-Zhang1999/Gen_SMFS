@@ -11,6 +11,7 @@ from abc import ABC, abstractmethod # For abstract base class
 
 from .losses import NoisePredictionLoss, MechanicalPropertyLoss, GeneratedCurveMatchingLoss
 from .optimizers import get_optimizer, get_lr_scheduler
+from ..models.diffusion_model import SpacedDiffusion
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -222,6 +223,7 @@ class BaseTrainer(ABC):
             state['optimizer_state_dict'] = {name: o.state_dict() for name, o in self.optimizer.items()}
             if self.scheduler:
                 state['scheduler_state_dict'] = {name: s.state_dict() for name, s in self.scheduler.items() if s}
+
         # Add model/training config for reproducibility
         state['config'] = {
             'loss_config': self.loss_config,
@@ -268,12 +270,14 @@ class BaseTrainer(ABC):
             logging.error(f"Error loading checkpoint {checkpoint_path}: {e}")
             raise
 
+
 class DiffusionModelTrainer(BaseTrainer):
     """
     Trainer for ConditionalDiffusionModel.
     """
     def __init__(self,
                  model: nn.Module, # Specific model type
+                 diffusion: SpacedDiffusion,
                  train_dataloader: DataLoader,
                  val_dataloader: DataLoader,
                  optimizer_config: Dict[str, Any],
@@ -289,7 +293,7 @@ class DiffusionModelTrainer(BaseTrainer):
                          loss_config, epochs, device, log_dir, checkpoint_dir, save_interval, eval_interval)
 
         # --- Setup Diffusion-Specific Loss Functions ---
-        self.noise_loss_fn = NoisePredictionLoss()
+        self.diffusion = diffusion
         self.mech_prop_loss_fn = None
         self.curve_match_loss_fn = None
 
@@ -318,19 +322,22 @@ class DiffusionModelTrainer(BaseTrainer):
             if isinstance(sequence_data, torch.Tensor):
                 sequence_data = sequence_data.to(self.device)
             conditions = batch['conditions'].to(self.device)
+            t = torch.randint(0, self.diffusion.num_timesteps, (x_0.shape[0],), device=self.device)
+            model_kwargs = dict(y=conditions)
 
             self.optimizer.zero_grad()
 
-            # Model forward returns: x_t, t, predicted_noise, true_noise
-            x_t, t, predicted_noise, true_noise = self.model(x_0, sequence_data, conditions)
-
+            # Diffusion forward returns training loss
             current_total_loss = 0.0
+
             # 1. Noise Prediction Loss
-            noise_loss = self.noise_loss_fn(predicted_noise, true_noise)
+            loss_dict = self.diffusion.training_losses(self.model, x_0, t, model_kwargs)
+            noise_loss = loss_dict["loss"].mean()
             current_total_loss += self.noise_loss_weight * noise_loss
             running_losses['noise_loss'] += noise_loss.item()
 
-            # 2. Optional Mechanical Property Loss
+            """
+                        # 2. Optional Mechanical Property Loss
             if self.mech_prop_loss_fn and self.mech_prop_loss_weight > 0:
                 # This requires predicting x_0 from (x_t, predicted_noise, t)
                 # which might need a helper method in the ConditionalDiffusionModel
@@ -359,7 +366,7 @@ class DiffusionModelTrainer(BaseTrainer):
                      logging.debug(f"Epoch {epoch}, Batch {batch_idx}: Skipping curve match loss as _predict_x0_from_noise not found in model.")
                 except Exception as e:
                     logging.warning(f"Epoch {epoch}, Batch {batch_idx}: Error in curve match loss calculation: {e}")
-
+            """
 
             current_total_loss.backward()
             self.optimizer.step()
@@ -382,11 +389,17 @@ class DiffusionModelTrainer(BaseTrainer):
                 if isinstance(sequence_data, torch.Tensor):
                     sequence_data = sequence_data.to(self.device)
                 conditions = batch['conditions'].to(self.device)
+                t = torch.randint(0, self.diffusion.num_timesteps, (x_0.shape[0],), device=self.device)
+                model_kwargs = dict(y=conditions)
 
-                x_t, t, predicted_noise, true_noise = self.model(x_0, sequence_data, conditions)
+                self.optimizer.zero_grad()
 
+                # Diffusion forward returns training loss
                 current_total_loss = 0.0
-                noise_loss = self.noise_loss_fn(predicted_noise, true_noise)
+
+                # 1. Noise Prediction Loss
+                loss_dict = self.diffusion.training_losses(self.model, x_0, t, model_kwargs)
+                noise_loss = loss_dict["loss"].mean()
                 current_total_loss += self.noise_loss_weight * noise_loss
                 running_losses['noise_loss'] += noise_loss.item()
 
@@ -414,6 +427,7 @@ class DiffusionModelTrainer(BaseTrainer):
         epoch_losses = {name: (loss_sum / num_batches if num_batches > 0 else 0) for name, loss_sum in running_losses.items()}
         epoch_losses['time_seconds'] = time.time() - start_time
         return epoch_losses
+
 
 class VAETrainer(BaseTrainer):
     """
@@ -450,10 +464,10 @@ class VAETrainer(BaseTrainer):
 
         for batch_idx, batch in enumerate(self.train_dataloader):
             # VAEs typically take x_0 as input and try to reconstruct it
-            x_0 = batch['fe_curve']
+            x_0 = batch['fe_curve'].to(self.device)
             # VAEs can also be conditional, so handle sequence_data and conditions
-            sequence_data = batch.get('sequence_data') # .get() for optional
-            conditions = batch.get('conditions')
+            sequence_data = batch.get('sequence_data').to(self.device) # .get() for optional
+            conditions = batch.get('conditions').to(self.device)
 
             self.optimizer.zero_grad()
 
@@ -494,6 +508,7 @@ class VAETrainer(BaseTrainer):
         epoch_losses = {name: (loss_sum / num_batches if num_batches > 0 else 0) for name, loss_sum in running_losses.items()}
         epoch_losses['time_seconds'] = time.time() - start_time
         return epoch_losses
+
 
 
     def _validate_epoch(self, epoch: int) -> Dict[str, float]:

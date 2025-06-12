@@ -1,6 +1,7 @@
 # src/inference/generator.py
 
 import torch
+import torch.nn as nn
 import os
 import logging
 import pandas as pd
@@ -8,24 +9,12 @@ import numpy as np
 from typing import Union, List, Dict, Any
 
 # Import necessary modules from your project
-try:
-    from models.diffusion_model import ConditionalDiffusionModel
-    from data_processing.dataset import FEDataset # For understanding data format
-    from data_processing.preprocessing import encode_protein_sequences, encode_conditions # Might be needed if inputs are raw
-    from data_processing.utils import save_processed_data, load_raw_data # For loading/saving
-
-    # You will also need to import or define your model's specific configuration
-    # For example, if you saved config with your model:
-    # from config.model_config import ModelConfig
-
-except ImportError as e:
-    logging.error(f"Failed to import required modules: {e}")
-    logging.error("Please ensure src directory is in your PYTHONPATH or run from the project root.")
-    raise
+from Gen_SMFS.src.models import create_diffusion, DiT1D, SpacedDiffusion
+from Gen_SMFS.src.data_processing.dataset import FEDataset
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-def load_model_from_checkpoint(checkpoint_path: str, model_config: Dict[str, Any], device: Union[str, torch.device]) -> ConditionalDiffusionModel:
+def load_model_from_checkpoint(checkpoint_path: str, model_cfg: Dict[str, Any], device: Union[str, torch.device]) -> nn.Module:
     """
     Loads a trained ConditionalDiffusionModel from a checkpoint file.
 
@@ -52,23 +41,14 @@ def load_model_from_checkpoint(checkpoint_path: str, model_config: Dict[str, Any
     # Instantiate the model using the provided configuration
     # You might need to pass specific args from model_config depending on your model's __init__
     try:
-        model = ConditionalDiffusionModel(
-            fe_curve_length=model_config['fe_curve_length'],
-            fe_curve_channels=model_config.get('fe_curve_channels', 1),
-            protein_input_dim=model_config['protein_input_dim'],
-            protein_embed_dim=model_config['protein_embed_dim'],
-            protein_encoding_type=model_config['protein_encoding_type'],
-            protein_plm_name=model_config.get('protein_plm_name'),
-            protein_plm_embed_dim=model_config.get('protein_plm_embed_dim'),
-            protein_freeze_plm=model_config.get('protein_freeze_plm', True),
-            condition_input_dim=model_config['condition_input_dim'],
-            condition_embed_dim=model_config['condition_embed_dim'],
-            time_embed_dim=model_config['time_embed_dim'],
-            model_channels=model_config['model_channels'],
-            num_diffusion_steps=model_config['num_diffusion_steps'],
-            beta_schedule=model_config.get('beta_schedule', 'linear')
-            # Add any other specific model parameters from config
-        )
+        model = DiT1D(seq_len=model_cfg["seq_length"],
+                  patch_size=model_cfg["patch_size"],
+                  in_channels=model_cfg["in_channels"],
+                  hidden_size=model_cfg["hidden_size"],
+                  num_heads=model_cfg["num_heads"],
+                  condition_feature_size=model_cfg["condition_feature_size"],
+                  depth=model_cfg["depth"]
+                  )
     except KeyError as e:
         logging.error(f"Missing key in model_config: {e}. Cannot instantiate model.")
         raise
@@ -102,7 +82,8 @@ def load_model_from_checkpoint(checkpoint_path: str, model_config: Dict[str, Any
 
 
 def generate_fe_curves(
-    model: ConditionalDiffusionModel,
+    diffusion: SpacedDiffusion,
+    model: nn.Module,
     sequence_data: Union[torch.Tensor, List[str]],
     conditions: torch.Tensor,
     num_samples_per_input: int = 1, # Number of curves to generate for each (sequence, condition) pair
@@ -136,9 +117,8 @@ def generate_fe_curves(
         raise ValueError("num_samples_per_input must be at least 1.")
 
     # Determine the number of distinct inputs
-    num_inputs = len(sequence_data) if isinstance(sequence_data, list) else sequence_data.size(0)
-    if num_inputs != conditions.size(0):
-         raise ValueError("Number of sequence data samples and condition samples must match.")
+
+    num_inputs = len(conditions) if isinstance(conditions, list) else conditions.size(0)
 
     if num_samples_per_input > 1:
         logging.info(f"Generating {num_samples_per_input} curves for each of the {num_inputs} inputs.")
@@ -146,16 +126,17 @@ def generate_fe_curves(
         # This requires careful handling depending on how your ProteinEncoder takes input
         # If it takes a list of strings, you need to duplicate the strings.
         # If it takes a tensor, you duplicate the tensor.
-
-        if isinstance(sequence_data, list):
-             duplicated_sequence_data = [item for item in sequence_data for _ in range(num_samples_per_input)]
+        if sequence_data is None:
+            duplicated_sequence_data = None
+        elif isinstance(sequence_data, list):
+            duplicated_sequence_data = [item for item in sequence_data for _ in range(num_samples_per_input)]
         elif isinstance(sequence_data, torch.Tensor):
-             duplicated_sequence_data = sequence_data.repeat_interleave(num_samples_per_input, dim=0)
+            duplicated_sequence_data = sequence_data.repeat_interleave(num_samples_per_input, dim=0)
         else:
-             raise TypeError(f"Unsupported sequence_data type: {type(sequence_data)}")
+            raise TypeError(f"Unsupported sequence_data type: {type(sequence_data)}")
 
         duplicated_conditions = conditions.repeat_interleave(num_samples_per_input, dim=0)
-        logging.info(f"Duplicated inputs. Generating total of {len(duplicated_sequence_data)} curves.")
+        logging.info(f"Duplicated inputs. Generating total of {len(duplicated_conditions)} curves.")
 
         seq_input_for_generation = duplicated_sequence_data
         cond_input_for_generation = duplicated_conditions
@@ -171,19 +152,20 @@ def generate_fe_curves(
          seq_input_for_generation = seq_input_for_generation.to(device)
     cond_input_for_generation = cond_input_for_generation.to(device)
 
+    model_kwargs = dict(y=cond_input_for_generation)
+    output_shape = (num_samples_per_input, model.in_channels, model.seq_len)
+    assert output_shape[0] == cond_input_for_generation.shape[0]
 
     with torch.no_grad():
         # Call the model's generate method
-        generated_curves = model.generate(
-            sequence_data=seq_input_for_generation, # Pass the potentially duplicated inputs
-            conditions=cond_input_for_generation,
-            num_samples=len(seq_input_for_generation), # The model's generate expects num_samples as batch size
+        samples = diffusion.p_sample_loop(
+            model, output_shape, clip_denoised=False, model_kwargs=model_kwargs, progress=True,
             device=device
         )
 
-    logging.info(f"Finished generating curves. Output shape: {generated_curves.shape}")
+    logging.info(f"Finished generating curves. Output shape: {samples.shape}")
 
-    return generated_curves
+    return samples
 
 
 # Example Usage

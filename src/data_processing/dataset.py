@@ -1,4 +1,5 @@
 import torch
+from sklearn.preprocessing import StandardScaler
 from torch.utils.data import Dataset
 import pandas as pd
 import numpy as np
@@ -8,7 +9,236 @@ import logging
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+
+class DataScaler:
+    """
+    A versatile data scaler for numpy arrays that supports different scaling
+    methods and can handle data of various dimensions.
+
+    The scaler computes statistics along the feature axis (the last axis).
+
+    Attributes:
+        method (str): The scaling method to use ('min-max' or 'std-mean').
+        min_ (np.ndarray): The minimum values for each feature. Only used for 'min-max'.
+        max_ (np.ndarray): The maximum values for each feature. Only used for 'min-max'.
+        mean_ (np.ndarray): The mean for each feature. Only used for 'std-mean'.
+        std_ (np.ndarray): The standard deviation for each feature. Only used for 'std-mean'.
+    """
+
+    def __init__(self, method: str = 'min-max'):
+        """
+        Initializes the DataScaler.
+
+        Args:
+            method (str): The scaling method to use.
+                          Supported methods: 'min-max', 'std-mean'.
+                          Defaults to 'min-max'.
+
+        Raises:
+            ValueError: If an unsupported method is provided.
+        """
+        if method not in ['min-max', 'std-mean']:
+            raise ValueError(f"Unsupported method '{method}'. Choose from 'min-max' or 'std-mean'.")
+        self.method = method
+        self.min_ = None
+        self.max_ = None
+        self.mean_ = None
+        self.std_ = None
+
+    def fit(self, data: np.ndarray):
+        """
+        Computes the necessary statistics (min/max or mean/std) from the data.
+
+        The statistics are calculated along all axes except the last one (feature axis).
+
+        Args:
+            data (np.ndarray): The input data to fit the scaler on.
+                               Shape can be (n_samples, n_features) or
+                               (n_samples, n_timesteps, n_features), etc.
+        """
+        # Determine the axes to compute statistics over (all except the last one)
+        axes = tuple(range(data.ndim - 1))
+
+        if self.method == 'min-max':
+            self.min_ = np.min(data, axis=axes)
+            self.max_ = np.max(data, axis=axes)
+        elif self.method == 'std-mean':
+            self.mean_ = np.mean(data, axis=axes)
+            self.std_ = np.std(data, axis=axes)
+
+        return self
+
+    def transform(self, data: np.ndarray) -> np.ndarray:
+        """
+        Scales the data using the previously computed statistics.
+
+        Args:
+            data (np.ndarray): The data to transform.
+
+        Returns:
+            np.ndarray: The transformed (scaled) data.
+
+        Raises:
+            RuntimeError: If the scaler has not been fitted yet.
+        """
+        if self.method == 'min-max':
+            if self.min_ is None or self.max_ is None:
+                raise RuntimeError("Scaler has not been fitted. Call fit() before transforming.")
+            # Add a small epsilon to avoid division by zero for features with no variance
+            denominator = self.max_ - self.min_
+            epsilon = 1e-8
+            return (data - self.min_) / (denominator + epsilon)
+
+        elif self.method == 'std-mean':
+            if self.mean_ is None or self.std_ is None:
+                raise RuntimeError("Scaler has not been fitted. Call fit() before transforming.")
+            # Add a small epsilon to avoid division by zero for features with zero variance
+            epsilon = 1e-8
+            return (data - self.mean_) / (self.std_ + epsilon)
+
+    def inverse_transform(self, data: np.ndarray) -> np.ndarray:
+        """
+        Reverts the scaled data back to its original representation.
+
+        Args:
+            data (np.ndarray): The scaled data to inverse transform.
+
+        Returns:
+            np.ndarray: The data in its original scale.
+
+        Raises:
+            RuntimeError: If the scaler has not been fitted yet.
+        """
+        if self.method == 'min-max':
+            if self.min_ is None or self.max_ is None:
+                raise RuntimeError("Scaler has not been fitted. Call fit() before inverse transforming.")
+            denominator = self.max_ - self.min_
+            epsilon = 1e-8
+            return data * (denominator + epsilon) + self.min_
+
+        elif self.method == 'std-mean':
+            if self.mean_ is None or self.std_ is None:
+                raise RuntimeError("Scaler has not been fitted. Call fit() before inverse transforming.")
+            epsilon = 1e-8
+            return data * (self.std_ + epsilon) + self.mean_
+
+    def fit_transform(self, data: np.ndarray) -> np.ndarray:
+        """
+        A convenience method that fits the scaler to the data and then transforms it.
+
+        Args:
+            data (np.ndarray): The input data.
+
+        Returns:
+            np.ndarray: The transformed (scaled) data.
+        """
+        self.fit(data)
+        return self.transform(data)
+
 class FEDataset(Dataset):
+    def __init__(self,
+                 fe_curves_path: str,
+                 sequences_path: str = None,
+                 conditions_path: str = None,
+                 seq_encoding_type: str = 'onehot',
+                 fe_curve_length: int = 1000,
+                 feature_first: bool = True,
+                 ):
+        """
+        Initializes the FEDataset.
+
+        Args:
+            fe_curves_path (str): Path to the processed F-E curve data file (e.g., .pkl, .csv).
+                                  Assumed to be a structure where curves can be indexed.
+            sequences_path (str): Path to the processed protein sequences data file (e.g., .csv).
+                                  Assumed to contain sequence strings or pre-encoded features.
+            conditions_path (str): Path to the processed experimental conditions data file (e.g., .csv).
+                                   Assumed to contain numerical conditions like pulling speed.
+            seq_encoding_type (str): Type of sequence encoding used in the sequences_path file.
+                                     Currently supports 'onehot' or 'pretrained_embeddings'.
+            fe_curve_length (int): The fixed length of the F-E curve vectors after preprocessing.
+            feature_first (bool): If feature_first is ture, the sample size is like (batch_size, feature_dim, seq_len)
+        """
+        # Load F-E curves, sequences, and conditions
+        self.feature_first = feature_first
+        self.fe_curves, self.fe_scaler = self.load_data(fe_curves_path, 'fe_curve', feature_first)
+        self.sequences, self.seq_scaler = self.load_data(sequences_path, 'sequences') \
+            if sequences_path else (None, None)
+        self.conditions, self.cond_scaler = self.load_data(conditions_path, 'conditions') \
+            if conditions_path else (None, None)
+
+        self.num_samples = len(self.fe_curves)
+        self.fe_curve_length = fe_curve_length
+
+    def load_data(self, file_path: str, data_type: str, feature_first: bool = False):
+        """Helper function to load different types of data."""
+        try:
+            if file_path.endswith('.pkl'):
+                data = pd.read_pickle(file_path)
+            elif file_path.endswith('.csv'):
+                data = pd.read_csv(file_path).values
+            elif file_path.endswith('.npy'):
+                data = np.load(file_path)
+            else:
+                raise ValueError(f"Unsupported file format for {data_type}: {file_path}")
+        except Exception as e:
+            logging.error(f"Error loading {data_type} from {file_path}: {e}")
+            raise
+
+        scaler = DataScaler()
+        data = scaler.fit_transform(data)
+
+        data = torch.FloatTensor(data)
+        if feature_first:
+            data = data.permute(0, 2, 1)
+
+        return data, scaler
+
+    def __len__(self):
+        return self.num_samples
+
+    def __getitem__(self, idx):
+        """
+        Retrieves a single data sample at the given index.
+        """
+        if idx < 0 or idx >= self.num_samples:
+            raise IndexError("Dataset index out of range.")
+
+        fe_curve = self.fe_curves[idx]
+
+
+        sequence_tensor = torch.ones(1)  # default empty tensor
+        if self.sequences is not None:
+            # Example for onehot encoding; adjust for actual encoding
+            sequence_tensor = self.sequences[idx]
+
+        conditions_tensor = torch.ones(1)  # default empty tensor
+        if self.conditions is not None:
+            conditions_tensor = self.conditions[idx]
+
+        sample = {
+            'fe_curve': fe_curve,
+            'sequence_data': sequence_tensor,
+            'conditions': conditions_tensor
+        }
+
+        return sample
+
+    def get_condition(self, idx):
+        conditions_tensor = torch.ones(1)  # default empty tensor
+        if self.conditions is not None:
+            conditions_tensor = self.conditions[idx]
+        return conditions_tensor.unsqueeze(0)
+
+    def move_to_device(self, sample, device):
+        """Move the sample tensors to the correct device."""
+        sample['fe_curve'] = sample['fe_curve'].to(device)
+        sample['sequence_data'] = sample['sequence_data'].to(device)
+        sample['conditions'] = sample['conditions'].to(device)
+        return sample
+
+
+class OldFEDataset(Dataset):
     """
     Custom Dataset class for loading and providing processed Force-Extension (F-E)
     curves, protein sequences, and experimental conditions for model training.
@@ -191,8 +421,6 @@ class FEDataset(Dataset):
             raise IndexError("Dataset index out of range.")
 
         fe_curve = self.fe_curves[idx]
-        if isinstance(fe_curve, list): # Handle case where loaded as list of lists
-            fe_curve = np.array(fe_curve)
 
         # Ensure the F-E curve is a numpy array of the expected shape (fe_curve_length,)
         if fe_curve.shape[0] != self.fe_curve_length:

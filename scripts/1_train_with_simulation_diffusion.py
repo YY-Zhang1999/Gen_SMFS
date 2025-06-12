@@ -11,8 +11,8 @@ import torch
 from torch.utils.data import DataLoader
 
 from Gen_SMFS.src.data_processing.dataset import FEDataset
-from Gen_SMFS.src.training.trainer import VAETrainer
-from Gen_SMFS.src.models.vae import create_conditiaonl_vae_model
+from Gen_SMFS.src.training.trainer import DiffusionModelTrainer
+from Gen_SMFS.src.models import create_diffusion, DiT1D
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -71,9 +71,9 @@ def main(data_config_path: str, model_config_path: str, training_config_path: st
 
     full_dataset = FEDataset(
         fe_curves_path=fe_curves_path,
-        device=device,
         conditions_path=conditions_path,
-        fe_curve_length=preprocessing_params['fe_curve_length']
+        fe_curve_length=preprocessing_params['fe_curve_length'],
+        feature_first=True
     )
 
     # Simple split: e.g., 80/20 train/val (seed for reproducibility)
@@ -92,6 +92,7 @@ def main(data_config_path: str, model_config_path: str, training_config_path: st
         batch_size=train_cfg['batch_size'],
         shuffle=True,
         collate_fn=collate_fn,
+        pin_memory=False,
         num_workers=0 # Example num_workers
     )
 
@@ -100,29 +101,30 @@ def main(data_config_path: str, model_config_path: str, training_config_path: st
         batch_size=train_cfg['batch_size'],
         shuffle=False,
         collate_fn=collate_fn,
-        num_workers=os.cpu_count() // 2 or 1
+        num_workers=0
     )
 
     # --- Model Initialization ---
     logging.info("Initializing model...")
-    model = create_conditiaonl_vae_model(
-        input_feature_dim=1,
-        sequence_len=preprocessing_params['fe_curve_length'],
-        latent_feature_dim=4,
-        conditional_dim=1,
-        scale_factor=4,
-        backbone_type='transformer',
-        use_crossattention=True,
-    )
+    model = DiT1D(seq_len=model_cfg["seq_length"],
+                  patch_size=model_cfg["patch_size"],
+                  in_channels=model_cfg["in_channels"],
+                  hidden_size=model_cfg["hidden_size"],
+                  num_heads=model_cfg["num_heads"],
+                  condition_feature_size=model_cfg["condition_feature_size"],
+                  depth=model_cfg["depth"]
+                  )
 
+    diffusion = create_diffusion(timestep_respacing=model_cfg["timestep_respacing"])
 
     logging.info("Model initialized.")
 
     # --- Trainer Setup ---
     logging.info("Setting up trainer...")
 
-    trainer = VAETrainer(
+    trainer = DiffusionModelTrainer(
         model=model,
+        diffusion=diffusion,
         train_dataloader=train_dataloader,
         val_dataloader=val_dataloader,
         optimizer_config=train_cfg['optimizer'],
@@ -165,6 +167,6 @@ def main(data_config_path: str, model_config_path: str, training_config_path: st
 
 if __name__ == "__main__":
     main('..\\config\\simulation_data_config.yaml',
-         '..\\config\\model_config.yaml',
+         '..\\config\\diffusion_model_config.yaml',
          '..\\config\\training_config.yaml',
          '..\\results')

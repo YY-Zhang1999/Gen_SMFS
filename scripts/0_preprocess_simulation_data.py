@@ -14,25 +14,14 @@ import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../src')))
 
 
-from Gen_SMFS.src.data_processing.preprocessing import read_simulation_data, standardize_fe_curve, preprocess_fe_curves, encode_protein_sequences, encode_conditions
-from Gen_SMFS.src.data_processing.utils import load_raw_data, save_processed_data, calculate_contour_length
-from Gen_SMFS.src.data_processing.dataset import FEDataset # To check expected output format
+from Gen_SMFS.src.data_processing import read_simulation_data, standardize_fe_curve, preprocess_fe_curves, encode_protein_sequences, encode_conditions
+from Gen_SMFS.src.data_processing import load_raw_data, save_processed_data, calculate_contour_length
+from Gen_SMFS.src.data_processing import FEDataset # To check expected output format
+from utils import load_config
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-def load_config(config_path: str) -> Dict[str, Any]:
-    """Loads configuration from a YAML file."""
-    try:
-        with open(config_path, 'r') as f:
-            config = yaml.safe_load(f)
-        logging.info(f"Configuration loaded from {config_path}")
-        return config
-    except FileNotFoundError:
-        logging.error(f"Config file not found at {config_path}")
-        sys.exit(1)
-    except yaml.YAMLError as e:
-        logging.error(f"Error parsing config file {config_path}: {e}")
-        sys.exit(1)
+
 
 def main(config_path: str):
     """
@@ -119,8 +108,7 @@ def main(config_path: str):
         # Add scaling parameters if implemented in encode_conditions
     )
 
-    if len(processed_conditions_array.shape) <= 2:
-        processed_conditions_array = np.expand_dims(processed_conditions_array, -1)
+
 
     print(processed_conditions_array.shape, processed_fe_curves_array.shape)
 
@@ -137,6 +125,7 @@ def main(config_path: str):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Preprocess raw protein unfolding data.")
     parser.add_argument('--config', type=str, required=True,
+                        default='../config/simulation_data_config.yaml',
                         help='Path to the data configuration YAML file.')
     args = parser.parse_args()
 

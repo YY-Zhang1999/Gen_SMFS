@@ -9,7 +9,7 @@ from torch import nn
 
 from .utils import count_params, DimUniversalStandardScaler, kl_div as _kl_div
 from .models import TimeDiffusionProjector, TimeDiffusionAttention, TimeDiffusionModel
-    
+
 
 class TD(nn.Module):
     """
